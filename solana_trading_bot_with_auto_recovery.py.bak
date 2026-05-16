@@ -1,5 +1,6 @@
 """
-Solana Trading Bot - 실제 거래 실행 활성화
+Solana Trading Bot - 자동 매매 버전
+로그 로테이션 + API 재연결 + 디스크 모니터링 + 오류 감지 + 자동 거래
 """
 
 import logging
@@ -10,21 +11,23 @@ import signal
 import sys
 import time
 import json
-import asyncio
+import requests
+import psutil
 from datetime import datetime, timedelta
 from functools import wraps
 import traceback
 import glob
+
 import ccxt
 import pandas as pd
 import numpy as np
+from binance.client import Client
 from telegram import Bot
 from telegram.error import TelegramError
 
-# 설정 불러오기
 try:
     from solana_bot_config import (
-        BINANCE_API_KEY,
+        BINANCE_API_KEY, 
         BINANCE_API_SECRET,
         SYMBOL,
         TIMEFRAME,
@@ -39,12 +42,9 @@ except ImportError as e:
     print(f"❌ 설정 파일 로드 실패: {e}")
     sys.exit(1)
 
-# ============================================================
-# 🔧 로깅 설정
-# ============================================================
-
 LOG_DIR = os.path.expanduser("~/solana_bot_new")
 LOG_FILE = os.path.join(LOG_DIR, "sol_trading_bot.log")
+
 os.makedirs(LOG_DIR, exist_ok=True)
 
 handler = logging.handlers.RotatingFileHandler(
@@ -57,8 +57,8 @@ formatter = logging.Formatter(
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-
 handler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(handler)
@@ -68,36 +68,65 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 logger.info("=" * 80)
-logger.info("🚀 Solana Trading Bot 시작 (실제 거래 실행 활성화)")
+logger.info("🚀 Solana Trading Bot 시작 (자동 매매 활성화)")
 logger.info("=" * 80)
 
 # ============================================================
-# 💾 디스크 모니터링
+# 🔴 오류 감지 시스템
 # ============================================================
 
+class ErrorDetector:
+    """긴급 오류 감지"""
+    
+    def __init__(self):
+        self.CPU_THRESHOLD = 80
+        self.MEMORY_THRESHOLD = 85
+        self.DISK_THRESHOLD = 90
+        logger.info("🔴 긴급 오류 감지 시스템 초기화")
+    
+    def check_system_health(self):
+        """시스템 건강 상태 체크"""
+        issues = []
+        
+        cpu_percent = psutil.cpu_percent(interval=1)
+        if cpu_percent > self.CPU_THRESHOLD:
+            issues.append(f"🔴 CPU 과부하: {cpu_percent}%")
+        
+        memory = psutil.virtual_memory()
+        if memory.percent > self.MEMORY_THRESHOLD:
+            issues.append(f"🔴 메모리 부족: {memory.percent}%")
+        
+        disk = psutil.disk_usage('/')
+        if disk.percent > self.DISK_THRESHOLD:
+            issues.append(f"🔴 디스크 부족: {disk.percent}%")
+        
+        return issues
+    
+    def detect_critical_errors(self):
+        """긴급 오류 감지"""
+        return self.check_system_health()
+
+error_detector = ErrorDetector()
+
 def check_disk_space(threshold=90):
-    """디스크 사용량 확인"""
     try:
         disk_usage = shutil.disk_usage("/")
         used_percent = (disk_usage.used / disk_usage.total) * 100
         free_gb = disk_usage.free / (1024 ** 3)
+        
         status = "🟢 정상" if used_percent < threshold else "🔴 경고"
         logger.info(f"{status} | 디스크: {used_percent:.1f}% | 남은공간: {free_gb:.2f}GB")
         
         if used_percent > threshold:
-            logger.warning(f"⚠️ 디스크 부족! {used_percent:.1f}% 사용 중")
+            logger.warning(f"⚠️  디스크 부족! {used_percent:.1f}% 사용 중")
             return False
+        
         return True
     except Exception as e:
         logger.error(f"❌ 디스크 체크 실패: {e}")
         return True
 
-# ============================================================
-# 🔄 API 재연결
-# ============================================================
-
 def retry_on_api_error(max_retries=3, delay=5):
-    """API 오류 시 자동 재시도"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -118,15 +147,11 @@ def retry_on_api_error(max_retries=3, delay=5):
         return wrapper
     return decorator
 
-# ============================================================
-# 🔗 Binance 연결
-# ============================================================
-
 @retry_on_api_error(max_retries=3, delay=5)
 def connect_binance(api_key, api_secret):
-    """Binance 연결"""
     try:
         logger.info("🔗 Binance Futures 연결 중...")
+        
         exchange = ccxt.binance({
             'apiKey': api_key,
             'secret': api_secret,
@@ -137,9 +162,11 @@ def connect_binance(api_key, api_secret):
                 'warnOnFetchOpenOrdersWithoutSymbol': False,
             }
         })
+        
         exchange.fetch_ticker(SYMBOL)
         logger.info(f"✅ Binance 연결 성공 ({SYMBOL})")
         return exchange
+    
     except ccxt.AuthenticationError as e:
         logger.error(f"❌ API 인증 실패: {e}")
         raise
@@ -147,43 +174,35 @@ def connect_binance(api_key, api_secret):
         logger.error(f"❌ Binance 연결 실패: {e}")
         raise
 
-# ============================================================
-# 📱 텔레그램 알림 (async)
-# ============================================================
-
 def send_telegram_alert(message, bot_token=None, chat_id=None):
-    """텔레그램 알림 (async 지원)"""
+    """텔레그램 알림"""
     if not bot_token or not chat_id:
-        logger.warning("⚠️ 텔레그램 설정 없음")
+        logger.warning("⚠️  텔레그램 설정 없음")
         return False
     
     for attempt in range(3):
         try:
-            asyncio.run(_send_message_async(bot_token, chat_id, message))
-            logger.info(f"✅ 텔레그램 발송 성공")
-            return True
-        except TelegramError as e:
-            logger.warning(f"🔄 텔레그램 실패 (시도 {attempt+1}/3): {e}")
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {"chat_id": chat_id, "text": message}
+            response = requests.post(url, json=payload, timeout=5)
+            
+            if response.status_code == 200:
+                logger.info(f"✅ 텔레그램 발송 성공")
+                return True
+            else:
+                logger.warning(f"🔄 텔레그램 응답 오류: {response.status_code}")
+        except requests.exceptions.Timeout:
+            logger.warning(f"🔄 텔레그램 타임아웃 (시도 {attempt+1}/3)")
             if attempt < 2:
                 time.sleep(5)
         except Exception as e:
-            logger.error(f"❌ 텔레그램 오류: {type(e).__name__} - {e}")
+            logger.warning(f"🔄 텔레그램 실패 (시도 {attempt+1}/3): {e}")
             if attempt < 2:
                 time.sleep(5)
     
     return False
 
-async def _send_message_async(bot_token, chat_id, message):
-    """비동기 텔레그램 메시지 발송"""
-    async with Bot(token=bot_token) as bot:
-        await bot.send_message(chat_id=chat_id, text=message)
-
-# ============================================================
-# 🛑 우아한 종료 처리
-# ============================================================
-
 class GracefulShutdown:
-    """프로그램 종료 시 깔끔하게 정리"""
     def __init__(self):
         self.shutting_down = False
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -191,8 +210,9 @@ class GracefulShutdown:
     
     def _signal_handler(self, sig, frame):
         if self.shutting_down:
-            logger.warning("⚠️ 강제 종료 중...")
+            logger.warning("⚠️  강제 종료 중...")
             sys.exit(1)
+        
         logger.info("=" * 80)
         logger.info("🛑 봇 종료 신호 수신")
         logger.info("=" * 80)
@@ -201,22 +221,20 @@ class GracefulShutdown:
     def is_shutting_down(self):
         return self.shutting_down
 
-# ============================================================
-# 📊 매매 데이터 조회
-# ============================================================
-
 @retry_on_api_error(max_retries=2, delay=3)
 def fetch_ohlcv_data(exchange, symbol, timeframe, limit=100):
-    """캔들 데이터 조회"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        
         df = pd.DataFrame(
             ohlcv,
             columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
         )
+        
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('datetime', inplace=True)
         df = df.sort_index()
+        
         logger.debug(f"✅ {symbol} 데이터 조회 완료 ({len(df)}개)")
         return df
     except Exception as e:
@@ -224,73 +242,130 @@ def fetch_ohlcv_data(exchange, symbol, timeframe, limit=100):
         raise
 
 def generate_signals(df, lookback=PIVOT_LOOKBACK):
-    """거래 신호 생성"""
     try:
         df = df.copy()
-        df['pivot'] = (df['high'].rolling(window=lookback).max() +
+        
+        df['pivot'] = (df['high'].rolling(window=lookback).max() + 
                        df['low'].rolling(window=lookback).min()) / 2
+        
         df['signal'] = np.where(df['close'] > df['pivot'], 1, 0)
         df['position'] = df['signal'].diff()
+        
         return df
     except Exception as e:
         logger.error(f"❌ 신호 생성 실패: {e}")
         raise
 
 # ============================================================
-# 💰 거래량 계산
+# 💰 자동 거래 실행
 # ============================================================
 
-def calculate_quantity(exchange, symbol, usdt_amount):
-    """USDT 금액을 기반으로 정확한 거래량 계산"""
-    try:
-        exchange.load_markets()
-        market = exchange.markets[symbol]
+class TradeExecutor:
+    """자동 거래 실행"""
+    
+    def __init__(self, client, api_key, api_secret):
+        self.client = client
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.in_position = False
+        self.position_type = None
+        self.entry_price = None
+        self.entry_time = None
+        self.stop_loss = None
+        self.take_profit = None
+        self.position_size = 0
+        self.current_balance = INITIAL_CAPITAL
+        logger.info("💰 자동 거래 실행 시스템 초기화")
+    
+    def place_order(self, signal_type, entry_price):
+        """주문 실행"""
+        try:
+            if signal_type == 'BUY':
+                risk = entry_price * 0.05  # 5% 손실
+                self.stop_loss = entry_price - risk
+                self.take_profit = entry_price + (risk * RR_RATIO)
+                self.position_size = (self.current_balance * LEVERAGE) / entry_price
+                
+                order = self.client.futures_create_order(
+                    symbol='SOLUSDT',
+                    side='BUY',
+                    type='MARKET',
+                    quantity=round(self.position_size, 3),
+                    leverage=LEVERAGE
+                )
+                
+                logger.info(f"✅ BUY 진입")
+                logger.info(f"   진입가: ${entry_price:.2f}")
+                logger.info(f"   손절: ${self.stop_loss:.2f}")
+                logger.info(f"   익절: ${self.take_profit:.2f}")
+                logger.info(f"   수량: {self.position_size:.4f} SOL")
+                
+                msg = f"✅ <b>BUY 진입</b>\n\n"
+                msg += f"💹 진입가: <b>${entry_price:.2f}</b>\n"
+                msg += f"🛑 손절: ${self.stop_loss:.2f}\n"
+                msg += f"🎯 익절: ${self.take_profit:.2f}\n"
+                msg += f"📊 수량: {self.position_size:.4f} SOL\n"
+                msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                send_telegram_alert(msg, TELEGRAM_BOT_TOKEN, CHAT_ID)
+                
+                self.in_position = True
+                self.position_type = 'LONG'
+                self.entry_price = entry_price
+                self.entry_time = datetime.now()
+                
+                return True
+            
+            elif signal_type == 'SELL':
+                risk = entry_price * 0.05
+                self.stop_loss = entry_price + risk
+                self.take_profit = entry_price - (risk * RR_RATIO)
+                self.position_size = (self.current_balance * LEVERAGE) / entry_price
+                
+                order = self.client.futures_create_order(
+                    symbol='SOLUSDT',
+                    side='SELL',
+                    type='MARKET',
+                    quantity=round(self.position_size, 3),
+                    leverage=LEVERAGE
+                )
+                
+                logger.info(f"✅ SELL 진입")
+                logger.info(f"   진입가: ${entry_price:.2f}")
+                logger.info(f"   손절: ${self.stop_loss:.2f}")
+                logger.info(f"   익절: ${self.take_profit:.2f}")
+                logger.info(f"   수량: {self.position_size:.4f} SOL")
+                
+                msg = f"✅ <b>SELL 진입</b>\n\n"
+                msg += f"💹 진입가: <b>${entry_price:.2f}</b>\n"
+                msg += f"🛑 손절: ${self.stop_loss:.2f}\n"
+                msg += f"🎯 익절: ${self.take_profit:.2f}\n"
+                msg += f"📊 수량: {self.position_size:.4f} SOL\n"
+                msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                send_telegram_alert(msg, TELEGRAM_BOT_TOKEN, CHAT_ID)
+                
+                self.in_position = True
+                self.position_type = 'SHORT'
+                self.entry_price = entry_price
+                self.entry_time = datetime.now()
+                
+                return True
         
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
-        
-        base_quantity = usdt_amount / current_price
-        
-        precision_info = market.get('precision', {})
-        amount_precision = precision_info.get('amount')
-        
-        if amount_precision is None:
-            amount_precision = 8
-        
-        amount_precision = int(amount_precision)
-        
-        min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
-        
-        quantity = round(base_quantity, amount_precision)
-        
-        if quantity < min_amount:
-            quantity = min_amount
-        
-        logger.info(f"💰 거래량 계산: {usdt_amount} USDT → {quantity} {symbol.split('/')[0]}")
-        logger.info(f"📊 정밀도: {amount_precision}자리 | 최소: {min_amount}")
-        
-        return quantity
-        
-    except Exception as e:
-        logger.error(f"❌ 거래량 계산 실패: {e}")
-        raise
-
-# ============================================================
-# 🎯 메인 루프
-# ============================================================
+        except Exception as e:
+            logger.error(f"❌ 거래 실행 실패: {e}")
+            send_telegram_alert(f"🚨 거래 실패: {str(e)[:100]}", TELEGRAM_BOT_TOKEN, CHAT_ID)
+            return False
 
 def main():
-    """메인 실행"""
     graceful_shutdown = GracefulShutdown()
     exchange = None
+    trade_executor = None
     
     logger.info("=" * 80)
-    logger.info("🚀 Solana Trading Bot 시작 (실제 거래 실행)")
+    logger.info("🚀 Solana Trading Bot 시작")
     logger.info(f"📊 설정: {SYMBOL} | {TIMEFRAME} | 레버리지 {LEVERAGE}배")
     logger.info("=" * 80)
     
     try:
-        # 디스크 초기 체크
         if not check_disk_space():
             logger.error("❌ 초기 디스크 부족 - 시작 실패")
             send_telegram_alert(
@@ -300,95 +375,76 @@ def main():
             )
             return
         
-        # Binance 연결
         exchange = connect_binance(BINANCE_API_KEY, BINANCE_API_SECRET)
         
+        # Binance 클라이언트 초기화
+        client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        trade_executor = TradeExecutor(client, BINANCE_API_KEY, BINANCE_API_SECRET)
+        
         send_telegram_alert(
-            f"✅ Solana 봇이 시작되었습니다.\n📊 {SYMBOL} | {TIMEFRAME}\n🎯 실제 거래 실행 중",
+            f"✅ Solana 봇이 시작되었습니다.\n📊 {SYMBOL} | {TIMEFRAME}",
             TELEGRAM_BOT_TOKEN,
             CHAT_ID
         )
         
-        # 메인 루프
         loop_count = 0
         last_disk_check = datetime.now()
+        last_error_check = datetime.now()
         
         while not graceful_shutdown.is_shutting_down():
             try:
                 loop_count += 1
                 logger.debug(f"📍 루프 #{loop_count}")
                 
-                # 10분마다 디스크 체크
                 if datetime.now() - last_disk_check > timedelta(minutes=10):
                     if not check_disk_space():
                         logger.error("❌ 디스크 부족 - 중지")
                         break
                     last_disk_check = datetime.now()
                 
-                # 데이터 조회
+                if datetime.now() - last_error_check > timedelta(minutes=5):
+                    errors = error_detector.detect_critical_errors()
+                    if errors:
+                        error_msg = "🚨 <b>긴급 오류 감지!</b>\n\n"
+                        error_msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        for error in errors:
+                            error_msg += f"{error}\n"
+                        error_msg += f"\n⚠️  <b>즉시 확인이 필요합니다!</b>"
+                        
+                        logger.error(f"긴급 오류 감지: {errors}")
+                        send_telegram_alert(error_msg, TELEGRAM_BOT_TOKEN, CHAT_ID)
+                    
+                    last_error_check = datetime.now()
+                
                 df = fetch_ohlcv_data(exchange, SYMBOL, TIMEFRAME, limit=100)
                 
-                # 신호 생성
                 df = generate_signals(df)
                 
-                # ⭐ 실제 거래 실행
+                # 거래 신호 및 실행
                 if 'position' in df.columns and df['position'].iloc[-1] != 0:
-                    signal_type = "🟢 BUY" if df['position'].iloc[-1] == 1 else "🔴 SELL"
+                    signal_type = "BUY" if df['position'].iloc[-1] == 1 else "SELL"
                     current_price = df['close'].iloc[-1]
-                    order_direction = "buy" if df['position'].iloc[-1] == 1 else "sell"
                     
-                    logger.info(f"{signal_type} | {SYMBOL} | {current_price:.2f}")
+                    logger.info(f"🎯 {signal_type} 신호 감지 | 가격: ${current_price:.2f}")
                     
-                    try:
-                        # 거래량 계산
-                        quantity = calculate_quantity(exchange, SYMBOL, INITIAL_CAPITAL * LEVERAGE)
-                        
-                        # ⭐ 실제 주문 실행
-                        logger.info(f"🎯 {order_direction.upper()} 주문 실행 중... | {quantity} {SYMBOL.split('/')[0]}")
-                        
-                        order = exchange.create_market_order(
-                            SYMBOL,
-                            order_direction,
-                            quantity
-                        )
-                        
-                        order_id = order.get('id')
-                        order_price = order.get('average', current_price)
-                        
-                        logger.info(f"✅ 주문 완료 | ID: {order_id} | 가격: {order_price:.2f}")
-                        
-                        # 텔레그램 알림
-                        send_telegram_alert(
-                            f"✅ {signal_type} 주문 실행\n"
-                            f"📊 {SYMBOL} | {order_price:.2f}\n"
-                            f"💰 수량: {quantity}\n"
-                            f"🆔 주문ID: {order_id}",
-                            TELEGRAM_BOT_TOKEN,
-                            CHAT_ID
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"❌ 주문 실행 실패: {type(e).__name__} - {e}")
-                        send_telegram_alert(
-                            f"🚨 {signal_type} 주문 실패\n"
-                            f"오류: {str(e)[:100]}",
-                            TELEGRAM_BOT_TOKEN,
-                            CHAT_ID
-                        )
+                    if not trade_executor.in_position:
+                        trade_executor.place_order(signal_type, current_price)
                 
                 time.sleep(60)
             
             except KeyboardInterrupt:
                 logger.info("⛔ 사용자 중단")
                 break
+            
             except Exception as e:
                 logger.error(f"❌ 루프 오류: {type(e).__name__} - {e}")
                 logger.debug(f"{traceback.format_exc()}")
                 time.sleep(10)
-    
+        
     except Exception as e:
         logger.error(f"❌ 심각한 오류: {type(e).__name__} - {e}")
         logger.debug(f"{traceback.format_exc()}")
+        
         send_telegram_alert(
             f"🚨 봇 오류:\n{type(e).__name__}: {str(e)[:100]}",
             TELEGRAM_BOT_TOKEN,
@@ -399,15 +455,12 @@ def main():
         logger.info("=" * 80)
         logger.info("⛔ Solana Trading Bot 종료")
         logger.info("=" * 80)
+        
         send_telegram_alert(
             "⛔ Solana 봇이 종료되었습니다.",
             TELEGRAM_BOT_TOKEN,
             CHAT_ID
         )
-
-# ============================================================
-# 🚀 실행
-# ============================================================
 
 if __name__ == "__main__":
     main()
