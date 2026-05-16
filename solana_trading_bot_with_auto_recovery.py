@@ -1,661 +1,348 @@
-# -*- coding: utf-8 -*-
 """
-솔라나(SOL/USDT) 실시간 자동 매매 봇 + 텔레그램 알림 + 매매일지 + 긴급 오류 감지 + 자동 복구
-거래소: Binance 선물 (Futures)
-한글 완벽 지원
+Solana Trading Bot - 오류 수정 버전
+로그 로테이션 + API 재연결 + 디스크 모니터링
 """
 
+import logging
+import logging.handlers
 import os
-from datetime import datetime, timedelta
+import shutil
+import signal
+import sys
 import time
+import json
+from datetime import datetime, timedelta
+from functools import wraps
+import traceback
+import glob
+
+import ccxt
 import pandas as pd
 import numpy as np
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
-import logging
-import sys
-import requests
+from telegram import Bot
+from telegram.error import TelegramError
 
-# 설정 파일 import
-from solana_bot_config import *
-from telegram_config import *
-from trading_journal import TradingJournal
-from error_detection import ErrorDetector
-from auto_recovery import AutoRecovery
+# 설정 불러오기
+try:
+    from solana_bot_config import (
+        BINANCE_API_KEY, 
+        BINANCE_API_SECRET,
+        SYMBOL,
+        TIMEFRAME,
+        LEVERAGE,
+        INITIAL_CAPITAL,
+        COMMISSION,
+        PIVOT_LOOKBACK,
+        RR_RATIO
+    )
+    from telegram_config import TELEGRAM_BOT_TOKEN, CHAT_ID
+except ImportError as e:
+    print(f"❌ 설정 파일 로드 실패: {e}")
+    sys.exit(1)
 
-# ──────────────────────────────────────────────────
-# 로깅 설정
-# ──────────────────────────────────────────────────
+# ============================================================
+# 🔧 로깅 설정 (로그 로테이션 - 10MB마다 자동 정리)
+# ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+LOG_DIR = os.path.expanduser("~/solana_bot_new")
+LOG_FILE = os.path.join(LOG_DIR, "sol_trading_bot.log")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# RotatingFileHandler: 10MB마다 자동으로 파일 교체
+handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=10 * 1024 * 1024,  # 10MB
+    backupCount=5  # 최대 5개 파일만 유지
 )
+
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+handler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
-# ──────────────────────────────────────────────────
-# 매매일지, 오류 감지, 자동 복구 초기화
-# ──────────────────────────────────────────────────
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
-journal = TradingJournal('trading_journals')
+logger.info("=" * 80)
+logger.info("🚀 Solana Trading Bot 시작 (로그 로테이션 활성화)")
+logger.info("=" * 80)
 
-# ──────────────────────────────────────────────────
-# 텔레그램 알림 함수
-# ──────────────────────────────────────────────────
+# ============================================================
+# 💾 디스크 모니터링 (90% 이상이면 경고 + 정리)
+# ============================================================
 
-def send_telegram_message(message):
-    """텔레그램으로 메시지 전송"""
+def check_disk_space(threshold=90):
+    """디스크 사용량 확인"""
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        response = requests.post(url, data=data)
-        if response.status_code == 200:
-            logger.info("📱 텔레그램 메시지 전송 완료")
-        else:
-            logger.warning(f"⚠️  텔레그램 전송 실패: {response.status_code}")
+        disk_usage = shutil.disk_usage("/")
+        used_percent = (disk_usage.used / disk_usage.total) * 100
+        free_gb = disk_usage.free / (1024 ** 3)
+        
+        status = "🟢 정상" if used_percent < threshold else "🔴 경고"
+        logger.info(f"{status} | 디스크: {used_percent:.1f}% | 남은공간: {free_gb:.2f}GB")
+        
+        if used_percent > threshold:
+            logger.warning(f"⚠️  디스크 부족! {used_percent:.1f}% 사용 중")
+            return False
+        
+        return True
     except Exception as e:
-        logger.error(f"❌ 텔레그램 전송 오류: {e}")
+        logger.error(f"❌ 디스크 체크 실패: {e}")
+        return True
 
-# ──────────────────────────────────────────────────
-# Binance 클라이언트 초기화
-# ──────────────────────────────────────────────────
+# ============================================================
+# 🔄 API 재연결 (3회 자동 재시도)
+# ============================================================
 
-def init_binance_client():
-    """Binance API 클라이언트 초기화"""
+def retry_on_api_error(max_retries=3, delay=5):
+    """API 오류 시 자동 재시도"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+                    logger.warning(f"🔄 API 오류 (시도 {attempt+1}/{max_retries}): {type(e).__name__}")
+                    if attempt < max_retries - 1:
+                        wait_time = delay * (2 ** attempt)
+                        logger.info(f"⏳ {wait_time}초 후 재시도...")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+                except Exception as e:
+                    logger.error(f"❌ 오류: {type(e).__name__} - {e}")
+                    raise
+        return wrapper
+    return decorator
+
+# ============================================================
+# 🔗 Binance 연결 (타임아웃 30초 + 재연결)
+# ============================================================
+
+@retry_on_api_error(max_retries=3, delay=5)
+def connect_binance(api_key, api_secret):
+    """Binance 연결"""
     try:
-        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-        # API 연결 테스트
-        account = client.futures_account()
-        logger.info(f"✅ Binance API 연결 성공")
-        logger.info(f"   계정 잔고: ${account['totalWalletBalance']} USDT")
+        logger.info("🔗 Binance Futures 연결 중...")
         
-        # 텔레그램 알림
-        msg = f"✅ <b>솔라나 자동 매매 봇 시작</b>\n\n"
-        msg += f"🤖 봇 상태: 정상\n"
-        msg += f"💰 계정 잔고: ${account['totalWalletBalance']} USDT\n"
-        msg += f"🔴 긴급 오류 감지: 활성화됨\n"
-        msg += f"🔄 자동 복구: 활성화됨\n"
-        msg += f"⏰ 시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        send_telegram_message(msg)
+        exchange = ccxt.binance({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+            'timeout': 30000,  # 30초 타임아웃
+            'options': {
+                'defaultType': 'future',
+                'warnOnFetchOpenOrdersWithoutSymbol': False,
+            }
+        })
         
-        return client
-    except BinanceAPIException as e:
-        logger.error(f"❌ Binance API 오류: {e}")
-        send_telegram_message(f"❌ <b>API 연결 실패</b>\n{str(e)}")
+        exchange.fetch_ticker(SYMBOL)
+        logger.info(f"✅ Binance 연결 성공 ({SYMBOL})")
+        return exchange
+    
+    except ccxt.AuthenticationError as e:
+        logger.error(f"❌ API 인증 실패: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ API 연결 실패: {e}")
-        send_telegram_message(f"❌ <b>예상치 못한 오류</b>\n{str(e)}")
+        logger.error(f"❌ Binance 연결 실패: {e}")
         raise
 
-# ──────────────────────────────────────────────────
-# 기술적 지표 계산
-# ──────────────────────────────────────────────────
+# ============================================================
+# 📱 텔레그램 알림
+# ============================================================
 
-def calculate_swing_points(df, lookback=PIVOT_LOOKBACK):
-    """스윙 하이/로우 계산"""
-    df = df.copy()
-    df['is_swing_high'] = df['high'] == df['high'].rolling(
-        window=lookback*2+1, center=True
-    ).max()
-    df['is_swing_low'] = df['low'] == df['low'].rolling(
-        window=lookback*2+1, center=True
-    ).min()
-    return df
-
-def fetch_ohlcv(client, symbol, interval, limit=100):
-    """OHLCV 데이터 조회"""
-    try:
-        klines = client.futures_klines(
-            symbol=symbol,
-            interval=interval,
-            limit=limit
-        )
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'
-        ])
-        
-        # 데이터 타입 변환
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col])
-        
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        return df[['open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        logger.error(f"❌ OHLCV 조회 실패: {e}")
-        return None
-
-# ──────────────────────────────────────────────────
-# 봇 클래스
-# ──────────────────────────────────────────────────
-
-class SolanaBot:
-    def __init__(self, client, symbol, initial_balance, leverage, error_detector, recovery):
-        self.client = client
-        self.symbol = symbol
-        self.initial_balance = initial_balance
-        self.leverage = leverage
-        self.current_balance = initial_balance
-        self.in_position = False
-        self.position_type = None
-        self.entry_price = 0
-        self.stop_loss = 0
-        self.take_profit = 0
-        self.position_size = 0
-        self.entry_time = None
-        self.error_detector = error_detector
-        self.recovery = recovery
-        
-        self.trades = []
-        self.winning_trades = 0
-        self.losing_trades = 0
-        
-        # 상태 변수
-        self.current_trend = 0
-        self.last_swing_high = 0
-        self.last_swing_low = 0
-        self.sweep_occurred = False
-        self.sweep_timer = 0
-        
-        logger.info(f"🤖 봇 초기화 완료")
-        logger.info(f"   종목: {symbol}")
-        logger.info(f"   초기 자본: ${initial_balance}")
-        logger.info(f"   레버리지: {leverage}배")
-    
-    def analyze_signal(self, df):
-        """SMC 신호 분석"""
-        if df is None or len(df) < PIVOT_LOOKBACK:
-            return None, None
-        
-        df = calculate_swing_points(df, PIVOT_LOOKBACK)
-        latest = df.iloc[-1]
-        
-        # 스윙 포인트 업데이트
-        if latest['is_swing_high']:
-            self.last_swing_high = latest['high']
-        if latest['is_swing_low']:
-            self.last_swing_low = latest['low']
-        
-        # 추세 식별
-        if self.last_swing_high > 0 and latest['close'] > self.last_swing_high:
-            self.current_trend = 1  # 상승 추세
-        elif self.last_swing_low > 0 and latest['close'] < self.last_swing_low:
-            self.current_trend = -1  # 하락 추세
-        
-        signal = None
-        
-        # 상승 추세 롱 신호
-        if self.current_trend == 1 and not self.in_position:
-            recent_lows = df['low'].iloc[-30:].loc[df['is_swing_low']]
-            if not self.sweep_occurred and not recent_lows.empty:
-                nearest_low = recent_lows.iloc[-1]
-                if latest['low'] < nearest_low and latest['close'] > nearest_low:
-                    self.sweep_occurred = True
-                    self.stop_loss = latest['low'] * 0.999
-                    self.sweep_timer = 0
-            
-            if self.sweep_occurred:
-                self.sweep_timer += 1
-                minor_high = df['high'].iloc[-5:].max()
-                if latest['close'] > minor_high and self.sweep_timer <= 40:
-                    signal = ('LONG', latest['close'])
-        
-        # 하락 추세 숏 신호
-        elif self.current_trend == -1 and not self.in_position:
-            recent_highs = df['high'].iloc[-30:].loc[df['is_swing_high']]
-            if not self.sweep_occurred and not recent_highs.empty:
-                nearest_high = recent_highs.iloc[-1]
-                if latest['high'] > nearest_high and latest['close'] < nearest_high:
-                    self.sweep_occurred = True
-                    self.stop_loss = latest['high'] * 1.001
-                    self.sweep_timer = 0
-            
-            if self.sweep_occurred:
-                self.sweep_timer += 1
-                minor_low = df['low'].iloc[-5:].min()
-                if latest['close'] < minor_low and self.sweep_timer <= 40:
-                    signal = ('SHORT', latest['close'])
-        
-        return signal, latest['close']
-    
-    def place_order(self, signal_type, entry_price):
-        """주문 실행"""
-        try:
-            if signal_type == 'LONG':
-                risk = entry_price - self.stop_loss
-                if risk <= 0:
-                    logger.warning(f"⚠️  롱 진입 실패: 위험 값 음수")
-                    return False
-                
-                self.take_profit = entry_price + (risk * RR_RATIO)
-                self.position_size = (self.current_balance * self.leverage) / entry_price
-                
-                # 선물 주문
-                order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='BUY',
-                    type='MARKET',
-                    quantity=round(self.position_size, 3),
-                    leverage=self.leverage
-                )
-                
-                logger.info(f"✅ 롱 진입")
-                logger.info(f"   진입가: ${entry_price:.2f}")
-                logger.info(f"   손절: ${self.stop_loss:.2f}")
-                logger.info(f"   익절: ${self.take_profit:.2f}")
-                logger.info(f"   수량: {self.position_size:.4f} SOL")
-                
-                # 텔레그램 알림
-                msg = f"✅ <b>롱 진입 신호</b>\n\n"
-                msg += f"💹 진입가: <b>${entry_price:.2f}</b>\n"
-                msg += f"🛑 손절: ${self.stop_loss:.2f}\n"
-                msg += f"🎯 익절: ${self.take_profit:.2f}\n"
-                msg += f"📊 수량: {self.position_size:.4f} SOL\n"
-                msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                send_telegram_message(msg)
-                
-                self.in_position = True
-                self.position_type = 'LONG'
-                self.entry_price = entry_price
-                self.entry_time = datetime.now()
-                
-                return True
-            
-            elif signal_type == 'SHORT':
-                risk = self.stop_loss - entry_price
-                if risk <= 0:
-                    logger.warning(f"⚠️  숏 진입 실패: 위험 값 음수")
-                    return False
-                
-                self.take_profit = entry_price - (risk * RR_RATIO)
-                self.position_size = (self.current_balance * self.leverage) / entry_price
-                
-                # 선물 주문
-                order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='SELL',
-                    type='MARKET',
-                    quantity=round(self.position_size, 3),
-                    leverage=self.leverage
-                )
-                
-                logger.info(f"✅ 숏 진입")
-                logger.info(f"   진입가: ${entry_price:.2f}")
-                logger.info(f"   손절: ${self.stop_loss:.2f}")
-                logger.info(f"   익절: ${self.take_profit:.2f}")
-                logger.info(f"   수량: {self.position_size:.4f} SOL")
-                
-                # 텔레그램 알림
-                msg = f"✅ <b>숏 진입 신호</b>\n\n"
-                msg += f"💹 진입가: <b>${entry_price:.2f}</b>\n"
-                msg += f"🛑 손절: ${self.stop_loss:.2f}\n"
-                msg += f"🎯 익절: ${self.take_profit:.2f}\n"
-                msg += f"📊 수량: {self.position_size:.4f} SOL\n"
-                msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                send_telegram_message(msg)
-                
-                self.in_position = True
-                self.position_type = 'SHORT'
-                self.entry_price = entry_price
-                self.entry_time = datetime.now()
-                
-                return True
-        
-        except BinanceAPIException as e:
-            logger.error(f"❌ 주문 실패: {e}")
-            self.error_detector.log_error(str(e), '주문 실패')
-            send_telegram_message(f"❌ <b>주문 실패</b>\n{str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"❌ 예상치 못한 오류: {e}")
-            self.error_detector.log_error(str(e), '예상치 못한 오류')
-            send_telegram_message(f"❌ <b>예상치 못한 오류</b>\n{str(e)}")
-            return False
-    
-    def check_exit(self, current_price):
-        """익절/손절 확인"""
-        if not self.in_position:
-            return False
-        
-        try:
-            if self.position_type == 'LONG':
-                if current_price <= self.stop_loss:
-                    # 손절
-                    pnl = (self.stop_loss - self.entry_price) * self.position_size
-                    exit_fee = abs(pnl) * FEE
-                    net_pnl = pnl - exit_fee
-                    self.current_balance += net_pnl
-                    
-                    logger.info(f"❌ 롱 손절")
-                    logger.info(f"   손절가: ${self.stop_loss:.2f}")
-                    logger.info(f"   손실: ${net_pnl:.2f}")
-                    logger.info(f"   남은 자본: ${self.current_balance:.2f}")
-                    
-                    # 매매일지 기록
-                    duration = datetime.now() - self.entry_time
-                    journal.log_trade(
-                        trade_type='LONG',
-                        entry_price=self.entry_price,
-                        exit_price=self.stop_loss,
-                        stop_loss=self.stop_loss,
-                        take_profit=self.take_profit,
-                        pnl=net_pnl,
-                        duration=duration
-                    )
-                    
-                    # 텔레그램 알림
-                    msg = f"❌ <b>롱 손절</b>\n\n"
-                    msg += f"💹 진입가: ${self.entry_price:.2f}\n"
-                    msg += f"🛑 손절가: <b>${self.stop_loss:.2f}</b>\n"
-                    msg += f"📉 손실: <b>${net_pnl:.2f}</b>\n"
-                    msg += f"💰 남은 자본: ${self.current_balance:.2f}\n"
-                    msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    send_telegram_message(msg)
-                    
-                    self.losing_trades += 1
-                    self._record_trade(net_pnl)
-                    self._exit_position()
-                    return True
-                
-                elif current_price >= self.take_profit:
-                    # 익절
-                    pnl = (self.take_profit - self.entry_price) * self.position_size
-                    exit_fee = pnl * FEE
-                    net_pnl = pnl - exit_fee
-                    self.current_balance += net_pnl
-                    
-                    logger.info(f"✅ 롱 익절")
-                    logger.info(f"   익절가: ${self.take_profit:.2f}")
-                    logger.info(f"   수익: ${net_pnl:.2f}")
-                    logger.info(f"   남은 자본: ${self.current_balance:.2f}")
-                    
-                    # 매매일지 기록
-                    duration = datetime.now() - self.entry_time
-                    journal.log_trade(
-                        trade_type='LONG',
-                        entry_price=self.entry_price,
-                        exit_price=self.take_profit,
-                        stop_loss=self.stop_loss,
-                        take_profit=self.take_profit,
-                        pnl=net_pnl,
-                        duration=duration
-                    )
-                    
-                    # 텔레그램 알림
-                    msg = f"✅ <b>롱 익절</b>\n\n"
-                    msg += f"💹 진입가: ${self.entry_price:.2f}\n"
-                    msg += f"🎯 익절가: <b>${self.take_profit:.2f}</b>\n"
-                    msg += f"📈 수익: <b>${net_pnl:.2f}</b>\n"
-                    msg += f"💰 남은 자본: ${self.current_balance:.2f}\n"
-                    msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    send_telegram_message(msg)
-                    
-                    self.winning_trades += 1
-                    self._record_trade(net_pnl)
-                    self._exit_position()
-                    return True
-            
-            elif self.position_type == 'SHORT':
-                if current_price >= self.stop_loss:
-                    # 손절
-                    pnl = (self.entry_price - self.stop_loss) * self.position_size
-                    exit_fee = abs(pnl) * FEE
-                    net_pnl = pnl - exit_fee
-                    self.current_balance += net_pnl
-                    
-                    logger.info(f"❌ 숏 손절")
-                    logger.info(f"   손절가: ${self.stop_loss:.2f}")
-                    logger.info(f"   손실: ${net_pnl:.2f}")
-                    logger.info(f"   남은 자본: ${self.current_balance:.2f}")
-                    
-                    # 매매일지 기록
-                    duration = datetime.now() - self.entry_time
-                    journal.log_trade(
-                        trade_type='SHORT',
-                        entry_price=self.entry_price,
-                        exit_price=self.stop_loss,
-                        stop_loss=self.stop_loss,
-                        take_profit=self.take_profit,
-                        pnl=net_pnl,
-                        duration=duration
-                    )
-                    
-                    # 텔레그램 알림
-                    msg = f"❌ <b>숏 손절</b>\n\n"
-                    msg += f"💹 진입가: ${self.entry_price:.2f}\n"
-                    msg += f"🛑 손절가: <b>${self.stop_loss:.2f}</b>\n"
-                    msg += f"📉 손실: <b>${net_pnl:.2f}</b>\n"
-                    msg += f"💰 남은 자본: ${self.current_balance:.2f}\n"
-                    msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    send_telegram_message(msg)
-                    
-                    self.losing_trades += 1
-                    self._record_trade(net_pnl)
-                    self._exit_position()
-                    return True
-                
-                elif current_price <= self.take_profit:
-                    # 익절
-                    pnl = (self.entry_price - self.take_profit) * self.position_size
-                    exit_fee = pnl * FEE
-                    net_pnl = pnl - exit_fee
-                    self.current_balance += net_pnl
-                    
-                    logger.info(f"✅ 숏 익절")
-                    logger.info(f"   익절가: ${self.take_profit:.2f}")
-                    logger.info(f"   수익: ${net_pnl:.2f}")
-                    logger.info(f"   남은 자본: ${self.current_balance:.2f}")
-                    
-                    # 매매일지 기록
-                    duration = datetime.now() - self.entry_time
-                    journal.log_trade(
-                        trade_type='SHORT',
-                        entry_price=self.entry_price,
-                        exit_price=self.take_profit,
-                        stop_loss=self.stop_loss,
-                        take_profit=self.take_profit,
-                        pnl=net_pnl,
-                        duration=duration
-                    )
-                    
-                    # 텔레그램 알림
-                    msg = f"✅ <b>숏 익절</b>\n\n"
-                    msg += f"💹 진입가: ${self.entry_price:.2f}\n"
-                    msg += f"🎯 익절가: <b>${self.take_profit:.2f}</b>\n"
-                    msg += f"📈 수익: <b>${net_pnl:.2f}</b>\n"
-                    msg += f"💰 남은 자본: ${self.current_balance:.2f}\n"
-                    msg += f"⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    send_telegram_message(msg)
-                    
-                    self.winning_trades += 1
-                    self._record_trade(net_pnl)
-                    self._exit_position()
-                    return True
-        
-        except Exception as e:
-            logger.error(f"❌ 익절/손절 확인 오류: {e}")
-            self.error_detector.log_error(str(e), '익절/손절 오류')
-            send_telegram_message(f"⚠️  <b>익절/손절 오류</b>\n{str(e)}")
-        
+def send_telegram_alert(message, bot_token=None, chat_id=None):
+    """텔레그램 알림 (3회 재시도)"""
+    if not bot_token or not chat_id:
+        logger.warning("⚠️  텔레그램 설정 없음")
         return False
     
-    def _exit_position(self):
-        """포지션 종료"""
-        self.in_position = False
-        self.position_type = None
-        self.sweep_occurred = False
-        self.sweep_timer = 0
+    for attempt in range(3):
+        try:
+            bot = Bot(token=bot_token)
+            bot.send_message(chat_id=chat_id, text=message)
+            logger.info(f"✅ 텔레그램 발송 성공")
+            return True
+        except TelegramError as e:
+            logger.warning(f"🔄 텔레그램 실패 (시도 {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"❌ 텔레그램 오류: {e}")
+            break
     
-    def _record_trade(self, pnl):
-        """거래 기록"""
-        self.trades.append({
-            'timestamp': datetime.now(),
-            'type': self.position_type,
-            'entry': self.entry_price,
-            'exit': self.take_profit if pnl > 0 else self.stop_loss,
-            'pnl': pnl,
-            'duration': datetime.now() - self.entry_time
-        })
-    
-    def print_status(self, current_price):
-        """상태 출력"""
-        print(f"\n{'='*80}")
-        print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*80}")
-        print(f"현재가: ${current_price:.2f}")
-        print(f"자본: ${self.current_balance:.2f} (초기: ${self.initial_balance})")
-        print(f"수익률: {(self.current_balance/self.initial_balance - 1)*100:.2f}%")
-        
-        if self.in_position:
-            print(f"\n📊 보유 포지션: {self.position_type}")
-            print(f"   진입가: ${self.entry_price:.2f}")
-            print(f"   손절: ${self.stop_loss:.2f}")
-            print(f"   익절: ${self.take_profit:.2f}")
-            
-            if self.position_type == 'LONG':
-                unrealized = (current_price - self.entry_price) * self.position_size
-            else:
-                unrealized = (self.entry_price - current_price) * self.position_size
-            print(f"   미실현 손익: ${unrealized:.2f}")
-        else:
-            print(f"\n대기 중... (추세: {['🔄', '📈', '📉'][self.current_trend + 1]})")
-        
-        print(f"\n📈 거래 통계:")
-        print(f"   총 거래: {self.winning_trades + self.losing_trades}")
-        print(f"   익절: {self.winning_trades}")
-        print(f"   손절: {self.losing_trades}")
-        win_rate = (self.winning_trades / (self.winning_trades + self.losing_trades) * 100) if (self.winning_trades + self.losing_trades) > 0 else 0
-        print(f"   승률: {win_rate:.1f}%")
-        print(f"{'='*80}\n")
+    return False
 
-# ──────────────────────────────────────────────────
-# 메인 루프
-# ──────────────────────────────────────────────────
+# ============================================================
+# 🛑 우아한 종료 처리
+# ============================================================
+
+class GracefulShutdown:
+    """프로그램 종료 시 깔끔하게 정리"""
+    def __init__(self):
+        self.shutting_down = False
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+    
+    def _signal_handler(self, sig, frame):
+        if self.shutting_down:
+            logger.warning("⚠️  강제 종료 중...")
+            sys.exit(1)
+        
+        logger.info("=" * 80)
+        logger.info("🛑 봇 종료 신호 수신")
+        logger.info("=" * 80)
+        self.shutting_down = True
+    
+    def is_shutting_down(self):
+        return self.shutting_down
+
+# ============================================================
+# 📊 매매 데이터 조회
+# ============================================================
+
+@retry_on_api_error(max_retries=2, delay=3)
+def fetch_ohlcv_data(exchange, symbol, timeframe, limit=100):
+    """캔들 데이터 조회"""
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        
+        df = pd.DataFrame(
+            ohlcv,
+            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        )
+        
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('datetime', inplace=True)
+        df = df.sort_index()
+        
+        logger.debug(f"✅ {symbol} 데이터 조회 완료 ({len(df)}개)")
+        return df
+    except Exception as e:
+        logger.error(f"❌ 데이터 조회 실패: {e}")
+        raise
+
+def generate_signals(df, lookback=PIVOT_LOOKBACK):
+    """거래 신호 생성"""
+    try:
+        df = df.copy()
+        
+        df['pivot'] = (df['high'].rolling(window=lookback).max() + 
+                       df['low'].rolling(window=lookback).min()) / 2
+        
+        df['signal'] = np.where(df['close'] > df['pivot'], 1, 0)
+        df['position'] = df['signal'].diff()
+        
+        return df
+    except Exception as e:
+        logger.error(f"❌ 신호 생성 실패: {e}")
+        raise
+
+# ============================================================
+# 🎯 메인 루프
+# ============================================================
 
 def main():
+    """메인 실행"""
+    graceful_shutdown = GracefulShutdown()
+    exchange = None
+    
     logger.info("=" * 80)
-    logger.info("🚀 솔라나 자동 매매 봇 시작 (자동 복구 시스템 활성화)")
+    logger.info("🚀 Solana Trading Bot 시작")
+    logger.info(f"📊 설정: {SYMBOL} | {TIMEFRAME} | 레버리지 {LEVERAGE}배")
     logger.info("=" * 80)
     
-    # 오류 감지 및 자동 복구 시스템 초기화
-    error_detector = ErrorDetector(send_telegram_message)
-    recovery = AutoRecovery(send_telegram_message)
-    
-    # 초기화
-    client = init_binance_client()
-    bot = SolanaBot(client, SYMBOL, INITIAL_BALANCE, LEVERAGE, error_detector, recovery)
-    
-    logger.info(f"\n📊 전략 설정:")
-    logger.info(f"   PIVOT_LOOKBACK: {PIVOT_LOOKBACK}")
-    logger.info(f"   RR_RATIO: {RR_RATIO}")
-    logger.info(f"   수수료: {FEE*100:.2f}%")
-    
-    # 봇 실행
-    error_count = 0
-    max_errors = 3
-    health_check_interval = 3600  # 1시간마다 시스템 건강 체크
-    last_health_check = time.time()
-    
-    while True:
-        try:
-            # 시스템 건강 주기적 체크 (1시간마다)
-            current_time = time.time()
-            if current_time - last_health_check > health_check_interval:
-                critical_errors = error_detector.detect_critical_errors(client)
-                if critical_errors:
-                    error_detector.send_critical_alert(critical_errors)
-                last_health_check = current_time
-            
-            # OHLCV 데이터 조회 - 자동 복구 포함
-            def fetch_data():
-                return fetch_ohlcv(client, SYMBOL, '1h', limit=100)
-            
-            df = recovery.retry_data_fetch(fetch_data, max_retries=5)
-            
-            if df is None:
-                error_count += 1
-                if error_count >= max_errors:
-                    logger.error(f"❌ {max_errors}회 연속 오류 후 자동 복구 실패")
-                    error_detector.log_error(f"{max_errors}회 연속 데이터 조회 실패", '심각한 오류')
-                    recovery.notify_recovery_failure(f"{max_errors}회 연속 데이터 조회 실패")
-                    break
-                
-                logger.warning(f"⚠️  데이터 조회 실패 ({error_count}/{max_errors})")
-                recovery.recover_from_error("데이터 수집 실패", '데이터 오류')
-                time.sleep(5)
-                continue
-            
-            # 성공 시 에러 카운트 초기화
-            if error_count > 0:
-                error_count = 0
-                recovery.notify_recovery_success()
-            
-            current_price = float(df['close'].iloc[-1])
-            
-            # 포지션 보유 중 → 익절/손절 확인
-            if bot.in_position:
-                bot.check_exit(current_price)
-            
-            # 포지션 미보유 → 신호 분석
-            else:
-                signal, price = bot.analyze_signal(df)
-                if signal:
-                    bot.place_order(signal[0], signal[1])
-            
-            # 상태 출력 (매 1시간마다)
-            bot.print_status(current_price)
-            
-            # 1시간 대기 (다음 캔들)
-            time.sleep(3600)
+    try:
+        # 디스크 초기 체크
+        if not check_disk_space():
+            logger.error("❌ 초기 디스크 부족 - 시작 실패")
+            send_telegram_alert(
+                "🚨 디스크 부족으로 봇이 시작되지 않았습니다.",
+                TELEGRAM_BOT_TOKEN,
+                CHAT_ID
+            )
+            return
         
-        except KeyboardInterrupt:
-            logger.info("\n⛔ 사용자가 봇을 종료했습니다.")
-            send_telegram_message(f"⛔ <b>봇 종료됨</b>\n사용자가 봇을 종료했습니다.")
-            break
-        except Exception as e:
-            logger.error(f"❌ 예상치 못한 오류: {e}")
-            error_detector.log_error(str(e), '예상치 못한 오류')
-            recovery.recover_from_error(str(e), '예상치 못한 오류')
-            error_count += 1
-            time.sleep(10)
+        # Binance 연결
+        exchange = connect_binance(BINANCE_API_KEY, BINANCE_API_SECRET)
+        
+        send_telegram_alert(
+            f"✅ Solana 봇이 시작되었습니다.\n📊 {SYMBOL} | {TIMEFRAME}",
+            TELEGRAM_BOT_TOKEN,
+            CHAT_ID
+        )
+        
+        # 메인 루프
+        loop_count = 0
+        last_disk_check = datetime.now()
+        
+        while not graceful_shutdown.is_shutting_down():
+            try:
+                loop_count += 1
+                logger.debug(f"📍 루프 #{loop_count}")
+                
+                # 10분마다 디스크 체크
+                if datetime.now() - last_disk_check > timedelta(minutes=10):
+                    if not check_disk_space():
+                        logger.error("❌ 디스크 부족 - 중지")
+                        break
+                    last_disk_check = datetime.now()
+                
+                # 데이터 조회
+                df = fetch_ohlcv_data(exchange, SYMBOL, TIMEFRAME, limit=100)
+                
+                # 신호 생성
+                df = generate_signals(df)
+                
+                # 거래 신호
+                if 'position' in df.columns and df['position'].iloc[-1] != 0:
+                    signal_type = "🟢 BUY" if df['position'].iloc[-1] == 1 else "🔴 SELL"
+                    logger.info(f"{signal_type} | {SYMBOL} | {df['close'].iloc[-1]:.2f}")
+                
+                time.sleep(60)
+            
+            except KeyboardInterrupt:
+                logger.info("⛔ 사용자 중단")
+                break
+            
+            except Exception as e:
+                logger.error(f"❌ 루프 오류: {type(e).__name__} - {e}")
+                logger.debug(f"{traceback.format_exc()}")
+                time.sleep(10)
+        
+    except Exception as e:
+        logger.error(f"❌ 심각한 오류: {type(e).__name__} - {e}")
+        logger.debug(f"{traceback.format_exc()}")
+        
+        send_telegram_alert(
+            f"🚨 봇 오류:\n{type(e).__name__}: {str(e)[:100]}",
+            TELEGRAM_BOT_TOKEN,
+            CHAT_ID
+        )
     
-    # 종료
-    logger.info("\n" + "=" * 80)
-    logger.info("📊 최종 통계")
-    logger.info("=" * 80)
-    logger.info(f"초기 자본: ${INITIAL_BALANCE}")
-    logger.info(f"최종 자본: ${bot.current_balance:.2f}")
-    logger.info(f"총 수익: ${bot.current_balance - INITIAL_BALANCE:.2f}")
-    logger.info(f"수익률: {(bot.current_balance/INITIAL_BALANCE - 1)*100:.2f}%")
-    logger.info(f"총 거래: {bot.winning_trades + bot.losing_trades}")
-    if (bot.winning_trades + bot.losing_trades) > 0:
-        logger.info(f"승률: {(bot.winning_trades/(bot.winning_trades + bot.losing_trades)*100):.1f}%")
-    logger.info("=" * 80)
-    
-    # 최종 보고서 출력
-    report = journal.generate_daily_report()
-    logger.info(report)
-    send_telegram_message(f"<b>일일 거래 보고서</b>\n\n{report}")
-    
-    # 오류 요약
-    error_summary = error_detector.get_error_summary()
-    logger.info(error_summary)
-    send_telegram_message(f"<b>오류 기록</b>{error_summary}")
-    
-    # 복구 상태
-    recovery_status = recovery.get_recovery_status()
-    logger.info(recovery_status)
+    finally:
+        logger.info("=" * 80)
+        logger.info("⛔ Solana Trading Bot 종료")
+        logger.info("=" * 80)
+        
+        send_telegram_alert(
+            "⛔ Solana 봇이 종료되었습니다.",
+            TELEGRAM_BOT_TOKEN,
+            CHAT_ID
+        )
 
-if __name__ == '__main__':
+# ============================================================
+# 🚀 실행
+# ============================================================
+
+if __name__ == "__main__":
     main()
