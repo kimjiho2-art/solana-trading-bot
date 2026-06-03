@@ -16,6 +16,8 @@ import position_manager
 from utils import notifier
 from strategies import btc_strategy, eth_strategy, xrp_strategy, sol_strategy
 from config import SYMBOLS, TIMEFRAME
+from trading_journal import record_trade, load_all_trades
+from ml_optimizer import run_optimization, is_training
 
 logging.basicConfig(
     level=logging.INFO,
@@ -373,3 +375,113 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
+
+# ============================================================
+# 매매일지 기록 (청산 시 호출)
+# ============================================================
+
+def record_trade_journal(
+    coin: str,
+    result: dict,
+    candles_1h: list,
+    daily_bias: str,
+    funding_rate: float = 0.0,
+) -> None:
+    """
+    포지션 청산 후 매매일지 자동 기록
+    result: position_manager.close_position() 반환값
+    """
+    try:
+        from utils.indicators import (
+            candles_to_dataframe, calculate_atr, calculate_ema,
+            calculate_rsi, calculate_macd, calculate_bollinger_bands,
+            calculate_volume_ma, calculate_supertrend
+        )
+
+        df = candles_to_dataframe(candles_1h)
+        atr = calculate_atr(df)
+        rsi = calculate_rsi(df)
+        st_df = calculate_supertrend(df, atr_period=10, multiplier=3.0)
+        supertrend_dir = int(st_df["supertrend_dir"].iloc[-1])
+
+        # 코인별 추가 지표
+        ema200 = None
+        macd_val = None
+        bb_position = None
+        vol_ratio = None
+
+        if coin == "BTC":
+            ema200 = float(calculate_ema(df, 200).iloc[-1])
+            vol_ma = calculate_volume_ma(df, 20)
+            current_vol = df["volume"].iloc[-1]
+            vol_ratio = round(current_vol / vol_ma.iloc[-1], 4) if vol_ma.iloc[-1] > 0 else 1.0
+
+        elif coin == "ETH":
+            macd_line, signal_line, _ = calculate_macd(df)
+            macd_val = float(macd_line.iloc[-1])
+
+        elif coin == "XRP":
+            upper, middle, lower = calculate_bollinger_bands(df)
+            close = df["close"].iloc[-1]
+            if close > upper.iloc[-1]:
+                bb_position = "upper"
+            elif close < lower.iloc[-1]:
+                bb_position = "lower"
+            else:
+                bb_position = "middle"
+            vol_ma = calculate_volume_ma(df, 20)
+            current_vol = df["volume"].iloc[-1]
+            vol_ratio = round(current_vol / vol_ma.iloc[-1], 4) if vol_ma.iloc[-1] > 0 else 1.0
+
+        record_trade(
+            symbol=coin,
+            direction=result["direction"],
+            entry_time=result["opened_at"],
+            entry_price=result["entry_price"],
+            exit_price=result["close_price"],
+            sl_price=result["sl_price"],
+            tp_price=result.get("tp_price"),
+            exit_type=result["close_type"],
+            pnl_usdt=result["pnl_usdt"],
+            pnl_pct=result["pnl_pct"],
+            leverage=result["leverage"],
+            position_usdt=result["position_usdt"],
+            supertrend_dir=supertrend_dir,
+            atr=atr,
+            ema200=ema200,
+            rsi=rsi,
+            macd=macd_val,
+            bb_position=bb_position,
+            volume_ratio=vol_ratio,
+            daily_bias=daily_bias,
+            funding_rate=funding_rate,
+        )
+        logger.info(f"[{coin}] 매매일지 기록 완료")
+
+    except Exception as e:
+        logger.error(f"[{coin}] 매매일지 기록 오류: {e}")
+
+
+# ============================================================
+# XGBoost 최적화 스케줄러 (매주 일요일 새벽 3시 KST)
+# ============================================================
+
+def run_weekly_optimization() -> None:
+    """
+    매주 일요일 새벽 3시 KST 전략 자동 최적화 실행
+    메인 루프에서 호출
+    """
+    from datetime import timedelta
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.now(kst)
+
+    # 일요일(6) + 새벽 3시
+    if now_kst.weekday() == 6 and now_kst.hour == 3 and now_kst.minute < 5:
+        logger.info("주간 전략 최적화 시작")
+        trades = load_all_trades()
+        result = run_optimization(trades, notifier)
+
+        if result.get("full_reset_required"):
+            logger.critical("전략 전면 수정 필요 — 봇 중단")
+            raise SystemExit("전략 전면 수정 필요")
