@@ -2,5 +2,5 @@
 # 텔레그램 설정
 # ──────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = "8790551429:AAEzpzv6_XnmapQqx_Gp0Qmd2cJirT33-qc"      # 봇 토큰 입력
+TELEGRAM_BOT_TOKEN = "8790551429:AAHaiwnyuhsjvT3TPDzIoXaDNaXpZmb-MEo"      # 봇 토큰 입력
 TELEGRAM_CHAT_ID = "7721128132"         # 채팅 ID 입력
