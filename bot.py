@@ -41,9 +41,8 @@ from trading_journal import record_trade, load_all_trades
 from ml_optimizer import run_optimization, is_training
 
 # ── 환경변수 설정 (notifier.py용) ────────────────────────
-os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
-os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
-
+os.environ.setdefault("TELEGRAM_TOKEN", TELEGRAM_BOT_TOKEN)
+os.environ.setdefault("TELEGRAM_CHAT_ID", str(TELEGRAM_CHAT_ID))
 # ── 로깅 설정 ─────────────────────────────────────────────
 LOG_DIR  = os.path.expanduser("~/solana_bot_new")
 LOG_FILE = os.path.join(LOG_DIR, "trading_bot.log")
