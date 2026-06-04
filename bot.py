@@ -92,7 +92,7 @@ def retry(max_retries=3, delay=5):
     return decorator
 
 
-def check_disk_space(threshold=90) -> bool:
+def check_disk_space(threshold=95) -> bool:
     """디스크 공간 체크 (기존 봇 그대로)"""
     try:
         usage = shutil.disk_usage("/")
