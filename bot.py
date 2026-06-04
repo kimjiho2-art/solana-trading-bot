@@ -41,8 +41,9 @@ from trading_journal import record_trade, load_all_trades
 from ml_optimizer import run_optimization, is_training
 
 # ── 환경변수 설정 (notifier.py용) ────────────────────────
-os.environ.setdefault("TELEGRAM_TOKEN", TELEGRAM_BOT_TOKEN)
-os.environ.setdefault("TELEGRAM_CHAT_ID", str(TELEGRAM_CHAT_ID))
+os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
+os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
+
 # ── 로깅 설정 ─────────────────────────────────────────────
 LOG_DIR  = os.path.expanduser("~/solana_bot_new")
 LOG_FILE = os.path.join(LOG_DIR, "trading_bot.log")
@@ -91,7 +92,7 @@ def retry(max_retries=3, delay=5):
     return decorator
 
 
-def check_disk_space(threshold=95) -> bool:
+def check_disk_space(threshold=90) -> bool:
     """디스크 공간 체크 (기존 봇 그대로)"""
     try:
         usage = shutil.disk_usage("/")
@@ -316,29 +317,56 @@ def _bind_strategy_functions():
 # 자정 초기화
 # ============================================================
 
-def daily_reset() -> None:
-    """매일 자정 KST 초기화"""
-    import strategy.main as sm
+def sync_positions_from_exchange() -> None:
+    """
+    봇 시작 시 거래소 실제 포지션 동기화
+    중복 진입 방지
+    """
+    logger.info("거래소 포지션 동기화 시작")
+    for coin, cfg in SYMBOLS.items():
+        symbol = cfg["symbol"]
+        try:
+            positions = exchange.fetch_positions([symbol])
+            for pos in positions:
+                contracts = float(pos.get("contracts") or 0)
+                if contracts != 0:
+                    direction = "LONG" if pos["side"] == "long" else "SHORT"
+                    entry_price = float(pos.get("entryPrice") or 0)
+                    if not position_manager.has_position(coin):
+                        # sl_price를 안전한 값으로 설정 (모니터링에서 거래소 청산 감지로 처리)
+                        safe_sl = 0.001 if direction == "LONG" else 999999999.0
+                        position_manager.open_position(
+                            symbol=coin,
+                            direction=direction,
+                            entry_price=entry_price,
+                            sl_price=safe_sl,
+                            tp_price=None,
+                            position_usdt=float(pos.get("initialMargin") or 0),
+                            leverage=cfg["max_leverage"],
+                        )
+                        logger.info(f"[{coin}] 기존 포지션 동기화: {direction} @ {entry_price}")
+        except Exception as e:
+            logger.warning(f"[{coin}] 포지션 동기화 실패: {e}")
+    logger.info("거래소 포지션 동기화 완료")
 
+
+def daily_reset() -> None:
+    """매일 UTC 자정 초기화 (바이낸스 일봉 마감 기준)"""
     logger.info("=== 자정 초기화 시작 ===")
 
-    # 전일 결산 먼저 보고
     total_balance = get_balance()
     daily_stats = notifier.get_daily_stats()
     notifier.notify_daily_summary(total_balance)
 
-    # 리스크/바이어스 초기화
     risk_manager.reset_daily()
     candle_filter.reset_bias()
     notifier.reset_daily_stats()
 
-    # 일봉 바이어스 업데이트
     def fetch_daily(symbol):
         return fetch_candles(symbol, "1d", limit=3)
 
     bias_dict = candle_filter.update_all_bias(fetch_daily)
 
-    # 아침 바이어스 + 전일 결산 보고
     notifier.notify_bias_update(
         bias_dict,
         prev_pnl=daily_stats["pnl"],
@@ -347,13 +375,6 @@ def daily_reset() -> None:
         prev_loss_count=daily_stats["loss_count"],
         current_balance=total_balance,
     )
-
-    # 월간 드로우다운 체크
-    if risk_manager.check_monthly_drawdown(total_balance):
-        start_bal = risk_manager._state.get("monthly_start_balance", total_balance)
-        drawdown = (start_bal - total_balance) / start_bal
-        notifier.notify_monthly_shutdown(drawdown, total_balance, start_bal)
-        raise SystemExit("월간 드로우다운 초과")
 
     logger.info("=== 자정 초기화 완료 ===")
 
@@ -364,8 +385,6 @@ def daily_reset() -> None:
 
 def process_signal(coin: str) -> str | None:
     """단일 종목 시그널 계산 및 필터링"""
-    import strategy.main as sm
-
     cfg = SYMBOLS[coin]
     symbol = cfg["symbol"]
 
@@ -600,7 +619,7 @@ def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -
     # 매매일지 기록
     try:
         candles_1h = fetch_candles(SYMBOLS[coin]["symbol"], "1h", limit=250)
-        from strategy.main import record_trade_journal
+        from main import record_trade_journal
         record_trade_journal(
             coin, result, candles_1h,
             candle_filter.get_bias(coin),
@@ -649,10 +668,10 @@ def run() -> None:
             return fetch_candles(symbol, "1d", limit=3)
         bias_dict = candle_filter.update_all_bias(fetch_daily)
 
-        # 월초 잔고 설정
-        total_balance = get_balance()
-        risk_manager.set_monthly_start_balance(total_balance)
+        # 봇 시작 시 거래소 실제 포지션 동기화 (중복 진입 방지)
+        sync_positions_from_exchange()
 
+        total_balance = get_balance()
         notifier.send_message(
             f"🚀 *자동매매 봇 시작*\n"
             f"─────────────────\n"
@@ -664,7 +683,7 @@ def run() -> None:
         )
 
         last_reset_date = None
-        last_signal_hour = -1
+        last_signal_hour = -1  # 봇 시작 시 즉시 시그널 체크
         last_disk_check = datetime.now()
 
         while not shutdown.is_shutting_down():
@@ -677,14 +696,10 @@ def run() -> None:
                 check_disk_space()
                 last_disk_check = datetime.now()
 
-            # ── 자정 초기화 KST (하루 1번) ───────────────────
-            if last_reset_date != now_kst.date():
+            # ── 자정 초기화 UTC 기준 (바이낸스 일봉 마감 시간과 일치) ──
+            if last_reset_date != now_utc.date():
                 daily_reset()
-                last_reset_date = now_kst.date()
-
-                # 월초 잔고 설정
-                if now_kst.day == 1:
-                    risk_manager.set_monthly_start_balance(get_balance())
+                last_reset_date = now_utc.date()
 
             # ── 주간 XGBoost 최적화 (일요일 새벽 3시 KST) ────
             if now_kst.weekday() == 6 and now_kst.hour == 3 and now_kst.minute < 1:
@@ -696,21 +711,18 @@ def run() -> None:
                 gc.collect()
 
             # ── 1시간봉 시그널 체크 ───────────────────────────
-            logger.info(f"시그널 체크 조건: last={last_signal_hour} now={now_kst.hour}")
-            if last_signal_hour != now_kst.hour:
-                last_signal_hour = now_kst.hour
-                logger.info("시그널 체크 시작")
+            if last_signal_hour != now_utc.hour:
+                last_signal_hour = now_utc.hour
+
                 for coin in SYMBOLS.keys():
                     try:
-                        logger.info(f"[{coin}] 시그널 계산 시작")
                         signal = process_signal(coin)
-                        logger.info(f"[{coin}] 시그널 결과: {signal}")
                         if signal:
                             execute_entry(coin, signal)
                     except Exception as e:
                         logger.error(f"[{coin}] 시그널 처리 오류: {e}")
                         notifier.notify_bot_error(f"[{coin}] 시그널 처리 오류", str(e)[:150])
-            
+
             # ── 포지션 실시간 모니터링 ────────────────────────
             try:
                 monitor_positions()
