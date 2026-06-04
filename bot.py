@@ -664,7 +664,7 @@ def run() -> None:
         )
 
         last_reset_date = None
-        last_signal_hour = None
+        last_signal_hour = -1
         last_disk_check = datetime.now()
 
         while not shutdown.is_shutting_down():
