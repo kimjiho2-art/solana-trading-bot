@@ -1,6 +1,6 @@
 # ============================================================
 # strategies/eth_strategy.py — ETH 전략
-# 슈퍼트렌드 + RSI + MACD
+# 슈퍼트렌드 방향 + RSI + MACD
 # ============================================================
 
 import logging
@@ -27,15 +27,9 @@ def check_signal(
 ) -> str | None:
     """
     ETH 1시간봉 시그널 계산
-    슈퍼트렌드 전환 + RSI 50 기준 + MACD 방향 일치
+    슈퍼트렌드 방향 + RSI 50 기준 + MACD 방향 일치
 
-    Args:
-        eth_candles: ETH 1시간봉 캔들 (최소 40개)
-        btc_candles: 미사용 (호환성 유지)
-        btc_dominance_trend: BTC 도미넌스 추세
-
-    Returns:
-        "LONG" / "SHORT" / None
+    변경: 전환 시점이 아닌 방향 일치 시 진입
     """
     if len(eth_candles) < 40:
         logger.warning("[ETH] 캔들 데이터 부족")
@@ -45,11 +39,7 @@ def check_signal(
 
     # 슈퍼트렌드 계산 (ATR 10, 배수 3.0)
     st_df = calculate_supertrend(df, atr_period=10, multiplier=3.0)
-    cross = st_df["supertrend_cross"].iloc[-1]
-
-    # 슈퍼트렌드 전환 없으면 시그널 없음
-    if cross not in ("BUY", "SELL"):
-        return None
+    st_dir = st_df["supertrend_dir"].iloc[-1]  # -1=상승, 1=하락
 
     # RSI
     rsi = calculate_rsi(df, period=INDICATORS["rsi_period"])
@@ -66,25 +56,25 @@ def check_signal(
     current_close = df["close"].iloc[-1]
 
     # ── 롱 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 BUY 전환
+    # 조건1: 슈퍼트렌드 방향 = 상승 (-1)
     # 조건2: RSI ≥ 50
     # 조건3: MACD 상승 방향
 
-    if cross == "BUY" and rsi >= 50 and macd_up:
+    if st_dir == -1 and rsi >= 50 and macd_up:
         logger.info(
-            f"[ETH] 롱 시그널 | 슈퍼트렌드 BUY | "
+            f"[ETH] 롱 시그널 | 슈퍼트렌드 상승 | "
             f"RSI: {rsi:.2f} | MACD 상승 | 현재가: {current_close}"
         )
         return "LONG"
 
     # ── 숏 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 SELL 전환
+    # 조건1: 슈퍼트렌드 방향 = 하락 (1)
     # 조건2: RSI ≤ 50
     # 조건3: MACD 하락 방향
 
-    if cross == "SELL" and rsi <= 50 and not macd_up:
+    if st_dir == 1 and rsi <= 50 and not macd_up:
         logger.info(
-            f"[ETH] 숏 시그널 | 슈퍼트렌드 SELL | "
+            f"[ETH] 숏 시그널 | 슈퍼트렌드 하락 | "
             f"RSI: {rsi:.2f} | MACD 하락 | 현재가: {current_close}"
         )
         return "SHORT"
