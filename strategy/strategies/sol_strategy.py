@@ -1,6 +1,6 @@
 # ============================================================
 # strategies/sol_strategy.py — SOL 전략
-# 슈퍼트렌드 + RSI + 트레일링 스탑
+# 슈퍼트렌드 방향 + RSI + 트레일링 스탑
 # ============================================================
 
 import logging
@@ -22,13 +22,9 @@ logger = logging.getLogger(__name__)
 def check_signal(candles: list) -> str | None:
     """
     SOL 1시간봉 시그널 계산
-    슈퍼트렌드 전환 + RSI 확인 (기준 완화)
+    슈퍼트렌드 방향 + RSI 확인 (기준 완화)
 
-    Args:
-        candles: SOL 1시간봉 캔들 (최소 25개)
-
-    Returns:
-        "LONG" / "SHORT" / None
+    변경: 전환 시점이 아닌 방향 일치 시 진입
     """
     if len(candles) < 25:
         logger.warning("[SOL] 캔들 데이터 부족")
@@ -38,34 +34,30 @@ def check_signal(candles: list) -> str | None:
 
     # 슈퍼트렌드 계산 (ATR 7, 배수 2.0)
     st_df = calculate_supertrend(df, atr_period=7, multiplier=2.0)
-    cross = st_df["supertrend_cross"].iloc[-1]
+    st_dir = st_df["supertrend_dir"].iloc[-1]  # -1=상승, 1=하락
 
-    # 슈퍼트렌드 전환 없으면 시그널 없음
-    if cross not in ("BUY", "SELL"):
-        return None
-
-    # RSI (SOL은 기준 완화 — 빠른 진입)
+    # RSI (SOL은 기준 완화)
     rsi = calculate_rsi(df, period=INDICATORS["rsi_period"])
     current_close = df["close"].iloc[-1]
 
     # ── 롱 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 BUY 전환
+    # 조건1: 슈퍼트렌드 방향 = 상승 (-1)
     # 조건2: RSI ≥ 45 (기준 완화)
 
-    if cross == "BUY" and rsi >= 45:
+    if st_dir == -1 and rsi >= 45:
         logger.info(
-            f"[SOL] 롱 시그널 | 슈퍼트렌드 BUY | "
+            f"[SOL] 롱 시그널 | 슈퍼트렌드 상승 | "
             f"RSI: {rsi:.2f} | 현재가: {current_close:.4f}"
         )
         return "LONG"
 
     # ── 숏 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 SELL 전환
+    # 조건1: 슈퍼트렌드 방향 = 하락 (1)
     # 조건2: RSI ≤ 55 (기준 완화)
 
-    if cross == "SELL" and rsi <= 55:
+    if st_dir == 1 and rsi <= 55:
         logger.info(
-            f"[SOL] 숏 시그널 | 슈퍼트렌드 SELL | "
+            f"[SOL] 숏 시그널 | 슈퍼트렌드 하락 | "
             f"RSI: {rsi:.2f} | 현재가: {current_close:.4f}"
         )
         return "SHORT"
@@ -74,10 +66,6 @@ def check_signal(candles: list) -> str | None:
 
 
 def get_trailing_distance(candles: list) -> float:
-    """
-    트레일링 스탑 거리 반환
-    ATR × trailing_atr_multiplier
-    """
     df = candles_to_dataframe(candles)
     atr = calculate_atr(df, period=INDICATORS["atr_period"])
     multiplier = SYMBOLS["SOL"]["trailing_atr_multiplier"]
