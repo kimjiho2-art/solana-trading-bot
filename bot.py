@@ -700,16 +700,17 @@ def run() -> None:
             if last_signal_hour != now_kst.hour:
                 last_signal_hour = now_kst.hour
                 logger.info("시그널 체크 시작")
-
                 for coin in SYMBOLS.keys():
                     try:
+                        logger.info(f"[{coin}] 시그널 계산 시작")
                         signal = process_signal(coin)
+                        logger.info(f"[{coin}] 시그널 결과: {signal}")
                         if signal:
                             execute_entry(coin, signal)
                     except Exception as e:
                         logger.error(f"[{coin}] 시그널 처리 오류: {e}")
                         notifier.notify_bot_error(f"[{coin}] 시그널 처리 오류", str(e)[:150])
-
+            
             # ── 포지션 실시간 모니터링 ────────────────────────
             try:
                 monitor_positions()
