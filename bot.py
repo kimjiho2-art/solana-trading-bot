@@ -696,8 +696,10 @@ def run() -> None:
                 gc.collect()
 
             # ── 1시간봉 시그널 체크 ───────────────────────────
+            logger.info(f"시그널 체크 조건: last={last_signal_hour} now={now_kst.hour}")
             if last_signal_hour != now_kst.hour:
                 last_signal_hour = now_kst.hour
+                logger.info("시그널 체크 시작")
 
                 for coin in SYMBOLS.keys():
                     try:
