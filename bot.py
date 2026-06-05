@@ -174,7 +174,7 @@ def get_balance() -> float:
     """USDT 잔고 조회"""
     try:
         bal = exchange.fetch_balance()
-        return float(bal["USDT"]["free"])
+        return float(bal["USDT"]["total"])
     except Exception as e:
         logger.error(f"잔고 조회 실패: {e}")
         return 0.0
@@ -229,6 +229,12 @@ def place_order(
 
         if qty <= 0:
             logger.warning(f"[{symbol}] 수량 계산 실패")
+            return False
+
+        # 가용 잔고 체크
+        free_balance = float(exchange.fetch_balance()["USDT"]["free"])
+        if free_balance < usdt_amount:
+            logger.warning(f"[{symbol}] 가용 잔고 부족 | 필요: {usdt_amount:.2f} | 가용: {free_balance:.2f}")
             return False
 
         # 시장가 진입
