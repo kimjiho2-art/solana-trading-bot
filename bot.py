@@ -575,9 +575,15 @@ def monitor_positions() -> None:
                     float(p["contracts"]) != 0 for p in exchange_positions
                 )
                 if not exchange_has_position and position_manager.has_position(coin):
-                    # 거래소에서 자동 청산됨 (SL/TP 히트)
+                    # 거래소에서 자동 청산됨
+                    # 수익이면 TP, 손실이면 SL로 판단
                     close_price = get_current_price(symbol)
-                    close_type = "TP" if tp_hit else "SL"
+                    pos = position_manager.get_position(coin)
+                    if pos["direction"] == "LONG":
+                        is_profit = close_price > pos["entry_price"]
+                    else:
+                        is_profit = close_price < pos["entry_price"]
+                    close_type = "TP" if is_profit else "SL"
                     result = position_manager.close_position(coin, close_type, close_price)
                     if result:
                         _handle_close(coin, result, hold_minutes, close_type)
