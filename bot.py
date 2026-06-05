@@ -29,6 +29,10 @@ from solana_bot_config import (
 )
 from telegram_config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+# ── 환경변수 설정 (notifier.py용) ────────────────────────
+os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
+os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
+
 # ── 새 전략 시스템 ────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "strategy"))
 import candle_filter
@@ -39,10 +43,6 @@ from strategies import btc_strategy, eth_strategy, xrp_strategy, sol_strategy
 from config import SYMBOLS, TIMEFRAME as STRATEGY_TIMEFRAME
 from trading_journal import record_trade, load_all_trades
 from ml_optimizer import run_optimization, is_training
-
-# ── 환경변수 설정 (notifier.py용) ────────────────────────
-os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
-os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
 
 # ── 로깅 설정 ─────────────────────────────────────────────
 LOG_DIR  = os.path.expanduser("~/solana_bot_new")
