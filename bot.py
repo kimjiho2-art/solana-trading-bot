@@ -411,6 +411,28 @@ def process_signal(coin: str) -> str | None:
     if position_manager.has_position(coin):
         return None
 
+    # 거래소 실제 포지션 직접 확인 (동기화 누락 방어)
+    try:
+        exchange_positions = exchange.fetch_positions([symbol])
+        for p in exchange_positions:
+            if float(p.get("contracts") or 0) != 0:
+                logger.info(f"[{coin}] 거래소에 실제 포지션 존재 — 진입 건너뜀")
+                # 메모리에도 등록 (다음부터 정상 인식)
+                direction = "LONG" if p["side"] == "long" else "SHORT"
+                safe_sl = 0.001 if direction == "LONG" else 999999999.0
+                position_manager.open_position(
+                    symbol=coin,
+                    direction=direction,
+                    entry_price=float(p.get("entryPrice") or 0),
+                    sl_price=safe_sl,
+                    tp_price=None,
+                    position_usdt=float(p.get("initialMargin") or 0),
+                    leverage=cfg["max_leverage"],
+                )
+                return None
+    except Exception as e:
+        logger.warning(f"[{coin}] 거래소 포지션 확인 실패: {e}")
+
     # 당일 재진입 가능 여부
     if not risk_manager.is_symbol_reentry_allowed(coin):
         return None
