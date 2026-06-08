@@ -669,7 +669,36 @@ def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -
                 risk_manager.get_state()["daily_stop_count"],
                 get_balance(),
             )
+            # 나머지 보유 포지션 전부 청산
+            _close_all_positions("일일 손절 한도 초과 — 전체 청산")
 
+def _close_all_positions(reason: str) -> None:
+    """보유 중인 모든 포지션 강제 청산"""
+    positions = position_manager.get_all_positions()
+    if not positions:
+        return
+
+    logger.warning(f"전체 포지션 청산 시작: {reason}")
+    notifier.send_message(f"⛔ *전체 포지션 강제 청산*\n이유: `{reason}`")
+
+    for coin, pos in list(positions.items()):
+        cfg = SYMBOLS[coin]
+        symbol = cfg["symbol"]
+        try:
+            close_price = close_order(symbol, pos["direction"])
+            result = position_manager.close_position(coin, "SL", close_price)
+            if result:
+                logger.warning(f"[{coin}] 강제 청산 완료 | {close_price}")
+                notifier.notify_close_sl(
+                    coin, pos["direction"],
+                    pos["entry_price"], close_price,
+                    result["pnl_usdt"], result["pnl_pct"],
+                    0,
+                    risk_manager.get_state()["daily_stop_count"],
+                    2,
+                )
+        except Exception as e:
+            logger.error(f"[{coin}] 강제 청산 실패: {e}")
 
 # ============================================================
 # 메인 루프
