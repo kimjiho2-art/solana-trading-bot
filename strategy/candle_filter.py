@@ -70,7 +70,7 @@ def update_daily_bias(symbol: str, daily_candles: list) -> str:
 
     # 전일 완성 봉 (인덱스 -2: 마지막은 현재 진행 중인 봉)
     prev_candle = daily_candles[-2]
-    o, h, l, c = prev_candle[0], prev_candle[1], prev_candle[2], prev_candle[3]
+    o, h, l, c = prev_candle[1], prev_candle[2], prev_candle[3], prev_candle[4]
 
     bias = get_candle_bias(o, h, l, c)
     _daily_bias[symbol] = bias
