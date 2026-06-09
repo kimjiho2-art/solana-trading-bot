@@ -29,10 +29,6 @@ from solana_bot_config import (
 )
 from telegram_config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-# ── 환경변수 설정 (notifier.py용) ────────────────────────
-os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
-os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
-
 # ── 새 전략 시스템 ────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "strategy"))
 import candle_filter
@@ -43,6 +39,10 @@ from strategies import btc_strategy, eth_strategy, xrp_strategy, sol_strategy
 from config import SYMBOLS, TIMEFRAME as STRATEGY_TIMEFRAME
 from trading_journal import record_trade, load_all_trades
 from ml_optimizer import run_optimization, is_training
+
+# ── 환경변수 설정 (notifier.py용) ────────────────────────
+os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
+os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
 
 # ── 로깅 설정 ─────────────────────────────────────────────
 LOG_DIR  = os.path.expanduser("~/solana_bot_new")
@@ -92,7 +92,7 @@ def retry(max_retries=3, delay=5):
     return decorator
 
 
-def check_disk_space(threshold=95) -> bool:
+def check_disk_space(threshold=90) -> bool:
     """디스크 공간 체크 (기존 봇 그대로)"""
     try:
         usage = shutil.disk_usage("/")
@@ -174,7 +174,7 @@ def get_balance() -> float:
     """USDT 잔고 조회"""
     try:
         bal = exchange.fetch_balance()
-        return float(bal["USDT"]["total"])
+        return float(bal["USDT"]["free"])
     except Exception as e:
         logger.error(f"잔고 조회 실패: {e}")
         return 0.0
@@ -229,12 +229,6 @@ def place_order(
 
         if qty <= 0:
             logger.warning(f"[{symbol}] 수량 계산 실패")
-            return False
-
-        # 가용 잔고 체크
-        free_balance = float(exchange.fetch_balance()["USDT"]["free"])
-        if free_balance < usdt_amount:
-            logger.warning(f"[{symbol}] 가용 잔고 부족 | 필요: {usdt_amount:.2f} | 가용: {free_balance:.2f}")
             return False
 
         # 시장가 진입
@@ -411,28 +405,6 @@ def process_signal(coin: str) -> str | None:
     if position_manager.has_position(coin):
         return None
 
-    # 거래소 실제 포지션 직접 확인 (동기화 누락 방어)
-    try:
-        exchange_positions = exchange.fetch_positions([symbol])
-        for p in exchange_positions:
-            if float(p.get("contracts") or 0) != 0:
-                logger.info(f"[{coin}] 거래소에 실제 포지션 존재 — 진입 건너뜀")
-                # 메모리에도 등록 (다음부터 정상 인식)
-                direction = "LONG" if p["side"] == "long" else "SHORT"
-                safe_sl = 0.001 if direction == "LONG" else 999999999.0
-                position_manager.open_position(
-                    symbol=coin,
-                    direction=direction,
-                    entry_price=float(p.get("entryPrice") or 0),
-                    sl_price=safe_sl,
-                    tp_price=None,
-                    position_usdt=float(p.get("initialMargin") or 0),
-                    leverage=cfg["max_leverage"],
-                )
-                return None
-    except Exception as e:
-        logger.warning(f"[{coin}] 거래소 포지션 확인 실패: {e}")
-
     # 당일 재진입 가능 여부
     if not risk_manager.is_symbol_reentry_allowed(coin):
         return None
@@ -566,12 +538,12 @@ def monitor_positions() -> None:
             except Exception:
                 hold_minutes = 0
 
-            # SOL 트레일링 스탑 업데이트
+            # SOL 트레일링 스탑 업데이트 (단계별)
             if cfg["trailing_stop"]:
                 candles_1h = fetch_candles(symbol, "1h", limit=20)
-                trailing_dist = sol_strategy.get_trailing_distance(candles_1h)
+                atr = sol_strategy.get_current_atr(candles_1h)
                 new_sl = position_manager.update_trailing_stop(
-                    coin, current_price, trailing_dist
+                    coin, current_price, atr
                 )
                 if new_sl:
                     sl_price = new_sl
@@ -597,11 +569,9 @@ def monitor_positions() -> None:
                     float(p["contracts"]) != 0 for p in exchange_positions
                 )
                 if not exchange_has_position and position_manager.has_position(coin):
-                    # 거래소에서 자동 청산됨
-                    # 수익이면 TP, 손실이면 SL로 판단
+                    # 거래소에서 자동 청산됨 — 수익 여부로 TP/SL 구분
                     close_price = get_current_price(symbol)
-                    pos = position_manager.get_position(coin)
-                    if pos["direction"] == "LONG":
+                    if direction == "LONG":
                         is_profit = close_price > pos["entry_price"]
                     else:
                         is_profit = close_price < pos["entry_price"]
@@ -615,9 +585,15 @@ def monitor_positions() -> None:
 
             if sl_hit:
                 close_price = close_order(symbol, direction)
-                result = position_manager.close_position(coin, "SL", close_price)
+                # 트레일링 스탑/손절 구분: 수익이면 TP, 손실이면 SL
+                if direction == "LONG":
+                    is_profit = close_price > pos["entry_price"]
+                else:
+                    is_profit = close_price < pos["entry_price"]
+                close_type = "TP" if is_profit else "SL"
+                result = position_manager.close_position(coin, close_type, close_price)
                 if result:
-                    _handle_close(coin, result, hold_minutes, "SL")
+                    _handle_close(coin, result, hold_minutes, close_type)
 
             elif tp_hit:
                 close_price = close_order(symbol, direction)
@@ -669,36 +645,7 @@ def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -
                 risk_manager.get_state()["daily_stop_count"],
                 get_balance(),
             )
-            # 나머지 보유 포지션 전부 청산
-            _close_all_positions("일일 손절 한도 초과 — 전체 청산")
 
-def _close_all_positions(reason: str) -> None:
-    """보유 중인 모든 포지션 강제 청산"""
-    positions = position_manager.get_all_positions()
-    if not positions:
-        return
-
-    logger.warning(f"전체 포지션 청산 시작: {reason}")
-    notifier.send_message(f"⛔ *전체 포지션 강제 청산*\n이유: `{reason}`")
-
-    for coin, pos in list(positions.items()):
-        cfg = SYMBOLS[coin]
-        symbol = cfg["symbol"]
-        try:
-            close_price = close_order(symbol, pos["direction"])
-            result = position_manager.close_position(coin, "SL", close_price)
-            if result:
-                logger.warning(f"[{coin}] 강제 청산 완료 | {close_price}")
-                notifier.notify_close_sl(
-                    coin, pos["direction"],
-                    pos["entry_price"], close_price,
-                    result["pnl_usdt"], result["pnl_pct"],
-                    0,
-                    risk_manager.get_state()["daily_stop_count"],
-                    2,
-                )
-        except Exception as e:
-            logger.error(f"[{coin}] 강제 청산 실패: {e}")
 
 # ============================================================
 # 메인 루프
