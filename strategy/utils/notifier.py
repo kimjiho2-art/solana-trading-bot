@@ -56,7 +56,7 @@ def _date_kst() -> str:
 
 def send_message(text: str) -> bool:
     """텔레그램 메시지 전송"""
-  token = _get_token()
+    token = _get_token()
     chat_id = _get_chat_id()
 
     if not token or not chat_id:
