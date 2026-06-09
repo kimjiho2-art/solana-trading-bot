@@ -1,6 +1,6 @@
 # ============================================================
 # strategies/xrp_strategy.py — XRP 전략
-# 슈퍼트렌드 방향 + 볼린저밴드 위치 + 거래량
+# 슈퍼트렌드 방향 + 볼린저밴드 위치 + 거래량 120%
 # ============================================================
 
 import logging
@@ -23,9 +23,7 @@ logger = logging.getLogger(__name__)
 def check_signal(candles: list) -> str | None:
     """
     XRP 1시간봉 시그널 계산
-    슈퍼트렌드 방향 + 볼린저밴드 위치 + 거래량 150% 급증
-
-    변경: 전환 시점이 아닌 방향 일치 시 진입
+    슈퍼트렌드 방향 + 볼린저밴드 중심선 + 거래량 120% 이상
     """
     if len(candles) < 30:
         logger.warning("[XRP] 캔들 데이터 부족")
@@ -44,36 +42,32 @@ def check_signal(candles: list) -> str | None:
         std_dev=INDICATORS["bb_std"],
     )
     current_close = df["close"].iloc[-1]
-    current_upper = upper.iloc[-1]
-    current_lower = lower.iloc[-1]
     current_middle = middle.iloc[-1]
 
-    # 거래량 급증
-    volume_surge = calculate_volume_surge(df, ratio=INDICATORS["volume_surge_ratio"])
+    # 거래량 급증 (150% → 120%로 완화)
+    volume_surge = calculate_volume_surge(df, ratio=1.2)
 
     # ── 롱 시그널 ──────────────────────────────────────────
     # 조건1: 슈퍼트렌드 방향 = 상승 (-1)
-    # 조건2: 현재가 > 볼린저밴드 중심선 이상
-    # 조건3: 거래량 급증
+    # 조건2: 현재가 ≥ 볼린저밴드 중심선
+    # 조건3: 거래량 ≥ 평균 대비 120%
 
     if st_dir == -1 and current_close >= current_middle and volume_surge:
         logger.info(
             f"[XRP] 롱 시그널 | 슈퍼트렌드 상승 | "
-            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f} | "
-            f"거래량 급증: {volume_surge}"
+            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f}"
         )
         return "LONG"
 
     # ── 숏 시그널 ──────────────────────────────────────────
     # 조건1: 슈퍼트렌드 방향 = 하락 (1)
-    # 조건2: 현재가 < 볼린저밴드 중심선 이하
-    # 조건3: 거래량 급증
+    # 조건2: 현재가 ≤ 볼린저밴드 중심선
+    # 조건3: 거래량 ≥ 평균 대비 120%
 
     if st_dir == 1 and current_close <= current_middle and volume_surge:
         logger.info(
             f"[XRP] 숏 시그널 | 슈퍼트렌드 하락 | "
-            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f} | "
-            f"거래량 급증: {volume_surge}"
+            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f}"
         )
         return "SHORT"
 
