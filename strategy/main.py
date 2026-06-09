@@ -406,13 +406,13 @@ def record_trade_journal(
         supertrend_dir = int(st_df["supertrend_dir"].iloc[-1])
 
         # 코인별 추가 지표
-        ema200 = None
+        ema22 = None
         macd_val = None
         bb_position = None
         vol_ratio = None
 
         if coin == "BTC":
-            ema200 = float(calculate_ema(df, 200).iloc[-1])
+            ema22 = float(calculate_ema(df, 22).iloc[-1])
             vol_ma = calculate_volume_ma(df, 20)
             current_vol = df["volume"].iloc[-1]
             vol_ratio = round(current_vol / vol_ma.iloc[-1], 4) if vol_ma.iloc[-1] > 0 else 1.0
@@ -449,7 +449,7 @@ def record_trade_journal(
             position_usdt=result["position_usdt"],
             supertrend_dir=supertrend_dir,
             atr=atr,
-            ema200=ema200,
+            ema200=ema22,
             rsi=rsi,
             macd=macd_val,
             bb_position=bb_position,
