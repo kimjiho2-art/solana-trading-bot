@@ -9,8 +9,29 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+def _get_token():
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    if not token:
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../config"))
+            from telegram_config import TELEGRAM_BOT_TOKEN
+            token = TELEGRAM_BOT_TOKEN
+        except Exception:
+            pass
+    return token
+
+def _get_chat_id():
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not chat_id:
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../config"))
+            from telegram_config import TELEGRAM_CHAT_ID as CHAT_ID
+            chat_id = str(CHAT_ID)
+        except Exception:
+            pass
+    return chat_id
 
 # 당일 손익 누적 추적
 _daily_pnl = 0.0
@@ -35,13 +56,16 @@ def _date_kst() -> str:
 
 def send_message(text: str) -> bool:
     """텔레그램 메시지 전송"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+  token = _get_token()
+    chat_id = _get_chat_id()
+
+    if not token or not chat_id:
         logger.warning("텔레그램 설정 없음. 알림 스킵.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,  
         "text": text,
         "parse_mode": "Markdown",
     }
