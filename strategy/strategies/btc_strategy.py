@@ -44,7 +44,8 @@ def check_signal(candles: list, funding_rate: float = 0.0) -> str | None:
     vol_ma = calculate_volume_ma(df, period=20)
     current_volume = df["volume"].iloc[-1]
     current_vol_ma = vol_ma.iloc[-1]
-    volume_ok = current_volume > current_vol_ma
+    # 거래량 조건 완화: 평균의 80% 이상이면 통과
+    volume_ok = current_volume > current_vol_ma * 0.8
 
     # ── 롱 시그널 ──────────────────────────────────────────
     # 조건1: 슈퍼트렌드 방향 = 상승 (-1)
