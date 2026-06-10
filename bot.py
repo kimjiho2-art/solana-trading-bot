@@ -635,6 +635,12 @@ def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -
             candle_filter.get_bias(coin),
             get_funding_rate(SYMBOLS[coin]["symbol"]),
         )
+        # 매매일지 기록 완료 알림 + 학습까지 남은 건수
+        total_count = len(load_all_trades())
+        notifier.notify_journal_recorded(
+            coin, result["direction"], close_type,
+            result["pnl_usdt"], total_count, min_required=30
+        )
     except Exception as e:
         logger.error(f"[{coin}] 매매일지 기록 오류: {e}")
 
@@ -706,8 +712,9 @@ def run() -> None:
                 check_disk_space()
                 last_disk_check = datetime.now()
 
-            # ── 자정 초기화 UTC 기준 (바이낸스 일봉 마감 시간과 일치) ──
-            if last_reset_date != now_utc.date():
+            # ── 자정 초기화 UTC 기준 (일봉 완전 확정 후: 00:05 이후) ──
+            # UTC 00:00 정각엔 직전 일봉이 미완성일 수 있어 5분 대기
+            if last_reset_date != now_utc.date() and (now_utc.hour > 0 or now_utc.minute >= 5):
                 daily_reset()
                 last_reset_date = now_utc.date()
 
