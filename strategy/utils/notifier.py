@@ -9,29 +9,8 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-def _get_token():
-    token = os.getenv("TELEGRAM_TOKEN", "")
-    if not token:
-        try:
-            import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../config"))
-            from telegram_config import TELEGRAM_BOT_TOKEN
-            token = TELEGRAM_BOT_TOKEN
-        except Exception:
-            pass
-    return token
-
-def _get_chat_id():
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not chat_id:
-        try:
-            import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../config"))
-            from telegram_config import TELEGRAM_CHAT_ID as CHAT_ID
-            chat_id = str(CHAT_ID)
-        except Exception:
-            pass
-    return chat_id
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # 당일 손익 누적 추적
 _daily_pnl = 0.0
@@ -56,16 +35,13 @@ def _date_kst() -> str:
 
 def send_message(text: str) -> bool:
     """텔레그램 메시지 전송"""
-    token = _get_token()
-    chat_id = _get_chat_id()
-
-    if not token or not chat_id:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("텔레그램 설정 없음. 알림 스킵.")
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,  
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
     }
@@ -369,3 +345,29 @@ def get_daily_stats() -> dict:
         "win_count": _daily_win_count,
         "loss_count": _daily_loss_count,
     }
+
+
+def notify_journal_recorded(symbol: str, direction: str, close_type: str,
+                            pnl_usdt: float, total_count: int,
+                            min_required: int = 30) -> None:
+    """매매일지 기록 완료 알림 + 학습까지 남은 건수"""
+    direction_kr = "롱" if direction == "LONG" else "숏"
+    type_kr = "익절" if close_type == "TP" else "손절"
+    pnl_sign = "+" if pnl_usdt >= 0 else ""
+
+    if total_count >= min_required:
+        learn_status = "✅ 학습 가능 (다음 일요일 새벽 3시 자동 실행)"
+    else:
+        remaining = min_required - total_count
+        learn_status = f"학습까지 `{remaining}건` 남음"
+
+    text = (
+        f"📝 *매매일지 기록 완료*\n"
+        f"─────────────────\n"
+        f"종목: `{symbol}` | `{direction_kr}` | `{type_kr}`\n"
+        f"손익: `{pnl_sign}{pnl_usdt:,.0f} USDT`\n\n"
+        f"누적 기록: `{total_count}건`\n"
+        f"{learn_status}\n"
+        f"🕐 {_now_kst()}"
+    )
+    send_message(text)
