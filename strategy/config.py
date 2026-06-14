@@ -1,81 +1,43 @@
 # ============================================================
-# config.py — 설정값 중앙 관리
+# config.py — 설정값 중앙 관리 (리플·이더 신호기반 전략)
+# ============================================================
+# 백테스트 검증 전략:
+#   XRP: 슈퍼트렌드 ATR10/3.0 + 1캔들지연 청산 + 4배 + 비중25%
+#   ETH: 슈퍼트렌드 ATR14/3.5 + 다음전환대기 청산 + 2배 + 비중40%
+# 청산: 신호기반 (슈퍼트렌드 방향 전환). ATR 손절/익절 없음
 # ============================================================
 
 # 종목별 설정
 SYMBOLS = {
-    "BTC": {
-        "symbol": "BTCUSDT",
-        "max_leverage": 5,
-        "capital_ratio": 0.25,
-        "atr_sl_multiplier": 1.5,
-        "atr_tp_multiplier": 3.0,
-        "trailing_stop": False,
+    "XRP": {
+        "symbol": "XRPUSDT",
+        "max_leverage": 4,             # 백테스트 최적 레버리지
+        "capital_ratio": 0.25,         # 잔고의 25%
+        "st_atr_period": 10,           # 슈퍼트렌드 ATR 기간
+        "st_multiplier": 3.0,          # 슈퍼트렌드 배수
+        "exit_mode": "delay1",         # 1캔들지연 청산
     },
     "ETH": {
         "symbol": "ETHUSDT",
-        "max_leverage": 5,
-        "capital_ratio": 0.25,
-        "atr_sl_multiplier": 1.5,
-        "atr_tp_multiplier": 3.0,
-        "trailing_stop": False,
+        "max_leverage": 2,             # 백테스트 최적 레버리지
+        "capital_ratio": 0.40,         # 잔고의 40%
+        "st_atr_period": 14,           # 슈퍼트렌드 ATR 기간
+        "st_multiplier": 3.5,          # 슈퍼트렌드 배수
+        "exit_mode": "wait_next",      # 다음전환대기 청산
     },
-    "XRP": {
-        "symbol": "XRPUSDT",
-        "max_leverage": 3,
-        "capital_ratio": 0.25,
-        "atr_sl_multiplier": 1.5,
-        "atr_tp_multiplier": 3.0,
-        "trailing_stop": False,
-    },
-    "SOL": {
-        "symbol": "SOLUSDT",
-        "max_leverage": 3,
-        "capital_ratio": 0.25,
-        "atr_sl_multiplier": 1.5,
-        "atr_tp_multiplier": None,       # SOL은 고정 목표가 없음
-        "trailing_stop": True,
-        "trailing_atr_multiplier": 2.0,
-    },
-}
-
-# 리스크 관리 설정
-RISK = {
-    "daily_stop_limit": 2,               # 일일 손절 횟수 한도
-    "monthly_drawdown_limit": 0.15,      # 월간 드로우다운 한도 15%
-    "doji_body_ratio": 0.15,             # 도지 몸통 비율 기준
-    "doji_wick_ratio_min": 0.7,          # 도지 꼬리 균형 최소
-    "doji_wick_ratio_max": 1.3,          # 도지 꼬리 균형 최대
-}
-
-# 지표 설정
-INDICATORS = {
-    "atr_period": 14,
-    "ema_fast": 20,
-    "ema_slow": 50,
-    "rsi_period": 14,
-    "rsi_mid": 50,
-    "bb_period": 20,
-    "bb_std": 2,
-    "volume_surge_ratio": 1.5,           # 거래량 급증 기준 150%
-    "macd_fast": 12,
-    "macd_slow": 26,
-    "macd_signal": 9,
-    "swing_lookback": 20,                # SOL 전고점/전저점 탐색 캔들 수
 }
 
 # 시간 설정
 TIMEFRAME = {
-    "candle": "1h",                      # 기준 봉
-    "daily": "1d",                       # 일봉 필터
-    "reset_hour_utc": 0,                 # 자정 리셋 (UTC)
+    "candle": "1h",                    # 기준 봉 (1시간봉)
+    "reset_hour_utc": 0,               # 자정 리셋 (UTC)
 }
 
-# 펀딩비 설정 (BTC/ETH)
-FUNDING = {
-    "long_limit": 0.001,                 # +0.1% 초과 시 롱 제한
-    "short_limit": -0.001,              # -0.1% 미만 시 숏 제한
+# 슈퍼트렌드 방향 정의 (⚠️ 백테스트 기준)
+#   direction == -1 : 상승 → 롱(LONG)
+#   direction == +1 : 하락 → 숏(SHORT)
+# indicators.py 의 calculate_supertrend 가 이 정의를 따르는지 반드시 확인
+SUPERTREND_DIR = {
+    "LONG": -1,
+    "SHORT": 1,
 }
-
-# XRP 볼린저밴드 돌파 확인 캔들 수
-XRP_BREAKOUT_CONFIRM_CANDLES = 3
