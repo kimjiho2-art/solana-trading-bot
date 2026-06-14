@@ -1,6 +1,12 @@
 # ============================================================
-# strategies/xrp_strategy.py — XRP 전략
-# 슈퍼트렌드 방향 + 볼린저밴드 위치 + 거래량 120%
+# strategies/xrp_strategy.py — 리플 전략 (신호기반)
+# 슈퍼트렌드 ATR10 / 배수3.0 단독
+# ============================================================
+# 백테스트 검증: 슈퍼트렌드 단독 + 1캔들지연 청산 + 4배
+# 보조지표 없음 (볼린저/거래량/RSI/MACD 전부 제거)
+#
+# 이 파일은 "신호"만 반환한다.
+# 진입/청산 타이밍(1캔들지연 등)은 bot.py가 포지션 상태로 판단.
 # ============================================================
 
 import logging
@@ -8,72 +14,56 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.indicators import (
-    calculate_atr,
-    calculate_supertrend,
-    calculate_bollinger_bands,
-    calculate_volume_surge,
-    candles_to_dataframe,
-)
-from config import INDICATORS
+from utils.indicators import calculate_supertrend, candles_to_dataframe
 
 logger = logging.getLogger(__name__)
 
+# 슈퍼트렌드 파라미터 (config와 일치)
+ST_ATR_PERIOD = 10
+ST_MULTIPLIER = 3.0
 
-def check_signal(candles: list) -> str | None:
+# 슈퍼트렌드 방향 정의 (indicators.py 실제 계산 기준)
+#   supertrend_dir == -1 → 상승(LONG)
+#   supertrend_dir == +1 → 하락(SHORT)
+DIR_LONG = -1
+DIR_SHORT = 1
+
+
+def get_signal(candles: list) -> dict:
     """
-    XRP 1시간봉 시그널 계산
-    슈퍼트렌드 방향 + 볼린저밴드 중심선 + 거래량 120% 이상
+    리플 슈퍼트렌드 신호 계산.
+
+    Returns dict:
+        {
+            "direction": "LONG" / "SHORT",   # 현재 슈퍼트렌드 방향
+            "flipped":   True / False,        # 직전 봉 대비 전환 발생 여부
+            "flip_to":   "LONG"/"SHORT"/None, # 전환됐다면 어느 방향으로
+            "price":     float,               # 최근 종가
+        }
+    데이터 부족 시 direction=None 반환.
     """
-    if len(candles) < 30:
+    if len(candles) < ST_ATR_PERIOD + 5:
         logger.warning("[XRP] 캔들 데이터 부족")
-        return None
+        return {"direction": None, "flipped": False, "flip_to": None, "price": 0.0}
 
     df = candles_to_dataframe(candles)
+    st_df = calculate_supertrend(df, atr_period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER)
 
-    # 슈퍼트렌드 계산 (ATR 7, 배수 2.0)
-    st_df = calculate_supertrend(df, atr_period=7, multiplier=2.0)
-    st_dir = st_df["supertrend_dir"].iloc[-1]  # -1=상승, 1=하락
+    cur_dir = int(st_df["supertrend_dir"].iloc[-1])
+    prev_dir = int(st_df["supertrend_dir"].iloc[-2])
+    price = float(df["close"].iloc[-1])
 
-    # 볼린저밴드
-    upper, middle, lower = calculate_bollinger_bands(
-        df,
-        period=INDICATORS["bb_period"],
-        std_dev=INDICATORS["bb_std"],
-    )
-    current_close = df["close"].iloc[-1]
-    current_middle = middle.iloc[-1]
+    direction = "LONG" if cur_dir == DIR_LONG else "SHORT"
 
-    # 거래량 급증 (150% → 120%로 완화)
-    volume_surge = calculate_volume_surge(df, ratio=1.2)
+    flipped = (cur_dir != prev_dir)
+    flip_to = None
+    if flipped:
+        flip_to = "LONG" if cur_dir == DIR_LONG else "SHORT"
+        logger.info(f"[XRP] 슈퍼트렌드 전환 → {flip_to} | 종가: {price}")
 
-    # ── 롱 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 방향 = 상승 (-1)
-    # 조건2: 현재가 ≥ 볼린저밴드 중심선
-    # 조건3: 거래량 ≥ 평균 대비 120%
-
-    if st_dir == -1 and current_close >= current_middle and volume_surge:
-        logger.info(
-            f"[XRP] 롱 시그널 | 슈퍼트렌드 상승 | "
-            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f}"
-        )
-        return "LONG"
-
-    # ── 숏 시그널 ──────────────────────────────────────────
-    # 조건1: 슈퍼트렌드 방향 = 하락 (1)
-    # 조건2: 현재가 ≤ 볼린저밴드 중심선
-    # 조건3: 거래량 ≥ 평균 대비 120%
-
-    if st_dir == 1 and current_close <= current_middle and volume_surge:
-        logger.info(
-            f"[XRP] 숏 시그널 | 슈퍼트렌드 하락 | "
-            f"현재가: {current_close:.4f} | BB중심: {current_middle:.4f}"
-        )
-        return "SHORT"
-
-    return None
-
-
-def get_current_atr(candles: list) -> float:
-    df = candles_to_dataframe(candles)
-    return calculate_atr(df, period=INDICATORS["atr_period"])
+    return {
+        "direction": direction,
+        "flipped": flipped,
+        "flip_to": flip_to,
+        "price": price,
+    }
