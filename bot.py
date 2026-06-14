@@ -1,11 +1,12 @@
 # ============================================================
-# bot.py — 메인 실행 파일 (기존 봇 인프라 + 새 전략 통합)
+# bot.py — 메인 실행 파일 (리플·이더 신호기반 전략)
 # ============================================================
-# 실행 방법: python bot.py
-# 위치: 저장소 루트 (solana-trading-bot/)
+# 실행: python bot.py  (저장소 루트)
+# 전략: 슈퍼트렌드 단독 + 신호기반 청산
+#   XRP: ATR10/3.0 + 1캔들지연 + 4배 + 25%
+#   ETH: ATR14/3.5 + 다음전환대기 + 2배 + 40%
 # ============================================================
 
-import gc
 import logging
 import logging.handlers
 import os
@@ -18,64 +19,49 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import ccxt
-import pandas as pd
 
-# ── 기존 봇 설정 파일 (키값 그대로 사용) ─────────────────
+# ── 기존 봇 설정 (API 키 그대로 재사용) ──────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "config"))
-from solana_bot_config import (
-    BINANCE_API_KEY,
-    BINANCE_SECRET_KEY,
-    TIMEFRAME,
-)
+from solana_bot_config import BINANCE_API_KEY, BINANCE_SECRET_KEY
 from telegram_config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # ── 새 전략 시스템 ────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "strategy"))
-import candle_filter
 import risk_manager
 import position_manager
 from utils import notifier
-from strategies import btc_strategy, eth_strategy, xrp_strategy, sol_strategy
-from config import SYMBOLS, TIMEFRAME as STRATEGY_TIMEFRAME
+from strategies import xrp_strategy, eth_strategy
+from config import SYMBOLS, TIMEFRAME
 from trading_journal import record_trade, load_all_trades
-from ml_optimizer import run_optimization, is_training
 
-# ── 환경변수 설정 (notifier.py용) ────────────────────────
+# ── 환경변수 (notifier.py용) ─────────────────────────────
 os.environ["TELEGRAM_TOKEN"] = TELEGRAM_BOT_TOKEN
 os.environ["TELEGRAM_CHAT_ID"] = str(TELEGRAM_CHAT_ID)
 
-# ── 로깅 설정 ─────────────────────────────────────────────
+# ── 로깅 ──────────────────────────────────────────────────
 LOG_DIR  = os.path.expanduser("~/solana_bot_new")
 LOG_FILE = os.path.join(LOG_DIR, "trading_bot.log")
 os.makedirs(LOG_DIR, exist_ok=True)
-
-handler = logging.handlers.RotatingFileHandler(
-    LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5
-)
-fmt = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-handler.setFormatter(fmt)
-
+handler = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
+handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger = logging.getLogger("trading_bot")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 logger.addHandler(logging.StreamHandler())
 
-# ── 거래소 전역 객체 ──────────────────────────────────────
 exchange = None
-
-# ── KST 타임존 ────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
+
+# 전략 매핑
+STRATEGY = {"XRP": xrp_strategy, "ETH": eth_strategy}
 
 
 # ============================================================
-# 유틸리티
+# 유틸리티 / 인프라 (기존 봇에서 재사용)
 # ============================================================
 
 def retry(max_retries=3, delay=5):
-    """API 재시도 데코레이터 (기존 봇 그대로)"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -93,14 +79,11 @@ def retry(max_retries=3, delay=5):
 
 
 def check_disk_space(threshold=90) -> bool:
-    """디스크 공간 체크 (기존 봇 그대로)"""
     try:
         usage = shutil.disk_usage("/")
-        pct   = usage.used / usage.total * 100
-        free  = usage.free / (1024 ** 3)
-        logger.info(f"디스크: {pct:.1f}% | 여유: {free:.2f}GB")
+        pct = usage.used / usage.total * 100
+        logger.info(f"디스크: {pct:.1f}% | 여유: {usage.free/(1024**3):.2f}GB")
         if pct > threshold:
-            logger.warning(f"디스크 부족: {pct:.1f}%")
             notifier.notify_bot_error("디스크 부족", f"{pct:.1f}% 사용 중")
             return False
         return True
@@ -110,115 +93,68 @@ def check_disk_space(threshold=90) -> bool:
 
 
 class GracefulShutdown:
-    """종료 신호 처리 (기존 봇 그대로)"""
     def __init__(self):
         self.shutting_down = False
         signal.signal(signal.SIGTERM, self._handler)
-        signal.signal(signal.SIGINT,  self._handler)
-
+        signal.signal(signal.SIGINT, self._handler)
     def _handler(self, sig, frame):
         logger.info("종료 신호 수신")
         self.shutting_down = True
-
     def is_shutting_down(self):
         return self.shutting_down
 
 
-# ============================================================
-# 거래소 연결
-# ============================================================
-
 @retry(max_retries=3, delay=5)
 def connect_binance():
-    """Binance 선물 연결 (기존 봇 그대로)"""
     logger.info("Binance Futures 연결 중...")
     exch = ccxt.binance({
-        "apiKey"         : BINANCE_API_KEY,
-        "secret"         : BINANCE_SECRET_KEY,
+        "apiKey": BINANCE_API_KEY,
+        "secret": BINANCE_SECRET_KEY,
         "enableRateLimit": True,
-        "timeout"        : 30000,
-        "options"        : {"defaultType": "future"},
+        "timeout": 30000,
+        "options": {"defaultType": "future"},
     })
     exch.load_markets()
-
-    # 4종목 레버리지 설정
     for coin, cfg in SYMBOLS.items():
-        symbol = cfg["symbol"]
-        leverage = cfg["max_leverage"]
         try:
-            exch.set_leverage(leverage, symbol)
-            exch.set_margin_mode("isolated", symbol)
-            logger.info(f"[{coin}] 레버리지 {leverage}배 / isolated 설정 완료")
+            exch.set_leverage(cfg["max_leverage"], cfg["symbol"])
+            exch.set_margin_mode("isolated", cfg["symbol"])
+            logger.info(f"[{coin}] 레버리지 {cfg['max_leverage']}배 / isolated 설정")
         except Exception as e:
             logger.warning(f"[{coin}] 레버리지 설정 실패: {e}")
-
     logger.info("Binance 연결 성공")
     return exch
 
 
 # ============================================================
-# strategy/main.py에 연동할 API 함수들
+# 거래소 API 함수
 # ============================================================
 
 @retry(max_retries=2, delay=3)
 def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list:
-    """
-    캔들 데이터 조회
-    반환: [[timestamp_ms, open, high, low, close, volume], ...]
-    """
-    ohlcv = exchange.fetch_ohlcv(symbol, interval, limit=limit)
-    return ohlcv
+    return exchange.fetch_ohlcv(symbol, interval, limit=limit)
 
 
 def get_balance() -> float:
-    """USDT 잔고 조회"""
     try:
         bal = exchange.fetch_balance()
-        return float(bal["USDT"]["free"])
+        return float(bal["USDT"]["total"])
     except Exception as e:
         logger.error(f"잔고 조회 실패: {e}")
         return 0.0
 
 
-def get_funding_rate(symbol: str) -> float:
-    """펀딩비 조회"""
-    try:
-        funding = exchange.fetch_funding_rate(symbol)
-        return float(funding.get("fundingRate", 0.0))
-    except Exception as e:
-        logger.warning(f"펀딩비 조회 실패: {e}")
-        return 0.0
-
-
 def get_current_price(symbol: str) -> float:
-    """현재가 조회"""
     try:
-        ticker = exchange.fetch_ticker(symbol)
-        return float(ticker["last"])
+        return float(exchange.fetch_ticker(symbol)["last"])
     except Exception as e:
         logger.error(f"현재가 조회 실패: {e}")
         return 0.0
 
 
-def get_btc_dominance_trend() -> str:
-    """BTC 도미넌스 추세 (선택적 구현)"""
-    return "FLAT"
-
-
-def place_order(
-    symbol: str,
-    direction: str,
-    usdt_amount: float,
-    leverage: int,
-    sl_price: float,
-    tp_price: float | None,
-) -> bool:
-    """
-    시장가 주문 + 손절/익절 설정
-    direction: "LONG" / "SHORT"
-    """
+def place_order(symbol: str, direction: str, usdt_amount: float, leverage: int) -> bool:
+    """시장가 진입. 신호기반 청산이므로 손절/익절 주문 안 검."""
     try:
-        # 수량 계산
         current_price = get_current_price(symbol)
         notional = usdt_amount * leverage
         qty = notional / current_price
@@ -226,35 +162,13 @@ def place_order(
         min_qty = float(market.get("limits", {}).get("amount", {}).get("min", 0.001))
         qty = max(qty, min_qty)
         qty = float(exchange.amount_to_precision(symbol, qty))
-
         if qty <= 0:
             logger.warning(f"[{symbol}] 수량 계산 실패")
             return False
-
-        # 시장가 진입
         side = "buy" if direction == "LONG" else "sell"
         exchange.create_market_order(symbol, side, qty)
-        logger.info(f"[{symbol}] {direction} 진입 | 수량: {qty} | 가격: ~${current_price:.4f}")
-        time.sleep(1)
-
-        # 손절 설정
-        sl_side = "sell" if direction == "LONG" else "buy"
-        exchange.create_order(
-            symbol, "STOP_MARKET", sl_side, qty,
-            params={"stopPrice": sl_price, "reduceOnly": True}
-        )
-        logger.info(f"[{symbol}] 손절 설정: ${sl_price:.4f}")
-
-        # 익절 설정 (SOL은 트레일링 스탑이므로 tp_price 없음)
-        if tp_price:
-            exchange.create_order(
-                symbol, "TAKE_PROFIT_MARKET", sl_side, qty,
-                params={"stopPrice": tp_price, "reduceOnly": True}
-            )
-            logger.info(f"[{symbol}] 익절 설정: ${tp_price:.4f}")
-
+        logger.info(f"[{symbol}] {direction} 진입 | 수량: {qty} | ~${current_price:.4f}")
         return True
-
     except Exception as e:
         logger.error(f"[{symbol}] 주문 실패: {e}\n{traceback.format_exc()}")
         notifier.notify_bot_error(f"[{symbol}] 주문 실패", str(e)[:150])
@@ -262,66 +176,32 @@ def place_order(
 
 
 def close_order(symbol: str, direction: str) -> float:
-    """포지션 청산"""
+    """시장가 청산."""
     try:
-        # 현재 포지션 조회
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
             if float(pos["contracts"]) != 0:
                 contracts = abs(float(pos["contracts"]))
                 close_side = "sell" if direction == "LONG" else "buy"
-
-                # 미체결 주문 취소
                 try:
                     exchange.cancel_all_orders(symbol)
                 except Exception:
                     pass
-
-                # 시장가 청산
-                exchange.create_market_order(
-                    symbol, close_side, contracts,
-                    params={"reduceOnly": True}
-                )
+                exchange.create_market_order(symbol, close_side, contracts, params={"reduceOnly": True})
                 close_price = get_current_price(symbol)
-                logger.info(f"[{symbol}] 청산 완료 | 가격: ${close_price:.4f}")
+                logger.info(f"[{symbol}] 청산 완료 | ${close_price:.4f}")
                 return close_price
-
         return get_current_price(symbol)
-
     except Exception as e:
         logger.error(f"[{symbol}] 청산 실패: {e}")
         return get_current_price(symbol)
 
 
 # ============================================================
-# strategy/main.py 함수들 로컬 바인딩
-# ============================================================
-
-def _bind_strategy_functions():
-    """
-    strategy/main.py의 NotImplementedError 함수들을
-    이 파일의 실제 함수로 교체
-    """
-    import strategy.main as sm
-    sm.fetch_candles       = fetch_candles
-    sm.get_balance         = get_balance
-    sm.get_funding_rate    = get_funding_rate
-    sm.get_current_price   = get_current_price
-    sm.get_btc_dominance_trend = get_btc_dominance_trend
-    sm.place_order         = place_order
-    sm.close_order         = close_order
-    logger.info("전략 함수 바인딩 완료")
-
-
-# ============================================================
-# 자정 초기화
+# 봇 시작 시 거래소 포지션 동기화 (중복진입 방지)
 # ============================================================
 
 def sync_positions_from_exchange() -> None:
-    """
-    봇 시작 시 거래소 실제 포지션 동기화
-    중복 진입 방지
-    """
     logger.info("거래소 포지션 동기화 시작")
     for coin, cfg in SYMBOLS.items():
         symbol = cfg["symbol"]
@@ -333,14 +213,8 @@ def sync_positions_from_exchange() -> None:
                     direction = "LONG" if pos["side"] == "long" else "SHORT"
                     entry_price = float(pos.get("entryPrice") or 0)
                     if not position_manager.has_position(coin):
-                        # sl_price를 안전한 값으로 설정 (모니터링에서 거래소 청산 감지로 처리)
-                        safe_sl = 0.001 if direction == "LONG" else 999999999.0
                         position_manager.open_position(
-                            symbol=coin,
-                            direction=direction,
-                            entry_price=entry_price,
-                            sl_price=safe_sl,
-                            tp_price=None,
+                            symbol=coin, direction=direction, entry_price=entry_price,
                             position_usdt=float(pos.get("initialMargin") or 0),
                             leverage=cfg["max_leverage"],
                         )
@@ -350,307 +224,157 @@ def sync_positions_from_exchange() -> None:
     logger.info("거래소 포지션 동기화 완료")
 
 
-def daily_reset() -> None:
-    """매일 UTC 자정 초기화 (바이낸스 일봉 마감 기준)"""
-    logger.info("=== 자정 초기화 시작 ===")
-
-    total_balance = get_balance()
-    daily_stats = notifier.get_daily_stats()
-    notifier.notify_daily_summary(total_balance)
-
-    risk_manager.reset_daily()
-    candle_filter.reset_bias()
-    notifier.reset_daily_stats()
-
-    def fetch_daily(symbol):
-        return fetch_candles(symbol, "1d", limit=3)
-
-    bias_dict = candle_filter.update_all_bias(fetch_daily)
-
-    notifier.notify_bias_update(
-        bias_dict,
-        prev_pnl=daily_stats["pnl"],
-        prev_trade_count=daily_stats["trade_count"],
-        prev_win_count=daily_stats["win_count"],
-        prev_loss_count=daily_stats["loss_count"],
-        current_balance=total_balance,
-    )
-
-    logger.info("=== 자정 초기화 완료 ===")
-
-
 # ============================================================
-# 시그널 처리 (strategy/main.py 연동)
+# 신호 처리 (매시간 봉 마감마다)
 # ============================================================
 
-def process_signal(coin: str) -> str | None:
-    """단일 종목 시그널 계산 및 필터링"""
+def process_coin(coin: str) -> None:
+    """
+    단일 코인 신호 처리.
+    슈퍼트렌드 방향/전환을 보고 진입·청산 판단.
+    리플=1캔들지연, 이더=다음전환대기.
+    """
     cfg = SYMBOLS[coin]
     symbol = cfg["symbol"]
+    mode = cfg["exit_mode"]
 
-    # 학습 중이면 진입 차단
-    if is_training():
-        return None
+    # 완성된 1시간봉 기준 신호 (마지막 진행중 봉 제외 위해 limit 넉넉히)
+    candles = fetch_candles(symbol, "1h", limit=100)
+    if not candles or len(candles) < 30:
+        logger.warning(f"[{coin}] 캔들 부족")
+        return
 
-    # 전체 매매 가능 여부
-    if not risk_manager.is_trading_allowed():
-        return None
+    sig = STRATEGY[coin].get_signal(candles)
+    if sig["direction"] is None:
+        return
 
-    # 일봉 바이어스 확인
-    bias = candle_filter.get_bias(coin)
-    if bias == "NONE":
-        return None
+    has_pos = position_manager.has_position(coin)
+    pos_dir = position_manager.get_position_direction(coin)
 
-    # 포지션 보유 여부
+    # ───────────────────────────────────────────────
+    # 1) 청산 판단: 포지션 보유 중 + 슈퍼트렌드가 반대로 전환
+    # ───────────────────────────────────────────────
+    if has_pos and sig["flipped"] and sig["flip_to"] != pos_dir:
+        close_price = close_order(symbol, pos_dir)
+        result = position_manager.close_position(coin, close_price)
+        if result:
+            _handle_close(coin, result)
+
+        if mode == "delay1":
+            # 리플: 반대방향 다음봉 진입 예약
+            position_manager.set_pending(coin, sig["flip_to"])
+        elif mode == "wait_next":
+            # 이더: 청산 후 대기. 다음 전환에 진입
+            position_manager.set_armed(coin, True)
+        return
+
+    # ───────────────────────────────────────────────
+    # 2) delay1 예약 진입 (리플): 지난 봉에 예약된 방향으로 진입
+    # ───────────────────────────────────────────────
+    if mode == "delay1":
+        pending = position_manager.get_pending(coin)
+        if pending and not has_pos:
+            _enter(coin, pending)
+            position_manager.set_pending(coin, None)
+            return
+
+    # ───────────────────────────────────────────────
+    # 3) 신규 진입 판단
+    # ───────────────────────────────────────────────
+    if not has_pos:
+        if mode == "delay1":
+            # 전환 감지 시 다음봉 진입 예약 (이번엔 예약만)
+            if sig["flipped"]:
+                position_manager.set_pending(coin, sig["flip_to"])
+                logger.info(f"[{coin}] 전환 감지 → 다음봉 {sig['flip_to']} 진입 예약")
+        elif mode == "wait_next":
+            # 다음전환대기: armed 상태에서 전환 오면 진입
+            if sig["flipped"] and position_manager.is_armed(coin):
+                _enter(coin, sig["flip_to"])
+                position_manager.set_armed(coin, False)
+            # 최초 진입(armed도 아니고 pending도 없는 초기상태)은
+            # 봇 시작 후 첫 전환부터 (set_armed True가 초기설정)
+
+
+def _enter(coin: str, direction: str) -> None:
+    """진입 실행 (중복진입 방지: 보유중이면 차단)"""
     if position_manager.has_position(coin):
-        return None
-
-    # 당일 재진입 가능 여부
-    if not risk_manager.is_symbol_reentry_allowed(coin):
-        return None
-
-    # 종목별 전략 시그널 계산
-    try:
-        candles_1h = fetch_candles(symbol, "1h", limit=250)
-        signal = None
-
-        if coin == "BTC":
-            funding = get_funding_rate(symbol)
-            signal = btc_strategy.check_signal(candles_1h, funding_rate=funding)
-        elif coin == "ETH":
-            btc_candles = fetch_candles(SYMBOLS["BTC"]["symbol"], "1h", limit=250)
-            signal = eth_strategy.check_signal(candles_1h, btc_candles)
-        elif coin == "XRP":
-            signal = xrp_strategy.check_signal(candles_1h)
-        elif coin == "SOL":
-            signal = sol_strategy.check_signal(candles_1h)
-
-    except Exception as e:
-        logger.error(f"[{coin}] 시그널 계산 오류: {e}")
-        return None
-
-    # 바이어스 방향 필터링
-    if signal and signal != bias:
-        notifier.notify_signal_ignored(
-            coin, signal,
-            f"바이어스 불일치 (시그널: {signal} / 바이어스: {bias})"
-        )
-        return None
-
-    return signal
-
-
-def execute_entry(coin: str, signal: str) -> None:
-    """포지션 진입 실행"""
-    from utils.indicators import (
-        candles_to_dataframe, calculate_atr,
-        calculate_supertrend, calculate_rsi,
-    )
-
+        logger.info(f"[{coin}] 이미 포지션 보유 — 진입 차단")
+        return
     cfg = SYMBOLS[coin]
     symbol = cfg["symbol"]
-
     try:
         total_balance = get_balance()
-        candles_1h = fetch_candles(symbol, "1h", limit=250)
-
-        # ATR 계산
-        if coin == "BTC":
-            atr = btc_strategy.get_current_atr(candles_1h)
-        elif coin == "ETH":
-            atr = eth_strategy.get_current_atr(candles_1h)
-        elif coin == "XRP":
-            atr = xrp_strategy.get_current_atr(candles_1h)
-        elif coin == "SOL":
-            atr = sol_strategy.get_current_atr(candles_1h)
-
+        size = risk_manager.calculate_position_size(coin, total_balance)
         entry_price = get_current_price(symbol)
-        size_info = risk_manager.calculate_position_size(
-            coin, entry_price, atr, total_balance
-        )
-        sl_tp = risk_manager.calculate_sl_tp(coin, entry_price, signal, atr)
-
-        # 주문 실행
-        success = place_order(
-            symbol=symbol,
-            direction=signal,
-            usdt_amount=size_info["position_usdt"],
-            leverage=size_info["leverage"],
-            sl_price=sl_tp["sl_price"],
-            tp_price=sl_tp["tp_price"],
-        )
-
-        if success:
+        ok = place_order(symbol, direction, size["position_usdt"], size["leverage"])
+        if ok:
             position_manager.open_position(
-                symbol=coin,
-                direction=signal,
-                entry_price=entry_price,
-                sl_price=sl_tp["sl_price"],
-                tp_price=sl_tp["tp_price"],
-                position_usdt=size_info["position_usdt"],
-                leverage=size_info["leverage"],
+                symbol=coin, direction=direction, entry_price=entry_price,
+                position_usdt=size["position_usdt"], leverage=size["leverage"],
             )
-
-            # 시그널 근거 수집
-            df = candles_to_dataframe(candles_1h)
-            st_df = calculate_supertrend(df, atr_period=10, multiplier=3.0)
-            rsi = calculate_rsi(df)
-            signal_info = {
-                "슈퍼트렌드": f"{'BUY' if signal == 'LONG' else 'SELL'} 전환",
-                "RSI": f"{rsi:.2f}",
-                "ATR": f"{atr:.4f}",
-            }
-
             notifier.notify_entry(
-                coin, signal, entry_price,
-                sl_tp["sl_price"], sl_tp["tp_price"],
-                size_info["leverage"], size_info["position_usdt"],
-                signal_info=signal_info,
-                daily_bias=candle_filter.get_bias(coin),
+                coin, direction, entry_price, 0, None,
+                size["leverage"], size["position_usdt"],
+                signal_info={"슈퍼트렌드": f"{direction} 전환"},
+                daily_bias=direction,
             )
-
     except Exception as e:
-        logger.error(f"[{coin}] 진입 실행 오류: {e}")
+        logger.error(f"[{coin}] 진입 오류: {e}")
         notifier.notify_bot_error(f"[{coin}] 진입 오류", str(e)[:150])
 
 
-def monitor_positions() -> None:
-    """포지션 손절/익절/트레일링 감시"""
-    positions = position_manager.get_all_positions()
+def _handle_close(coin: str, result: dict) -> None:
+    """청산 후 처리: 텔레그램 + 매매일지"""
+    close_type = "TP" if result["is_profit"] else "SL"
+    try:
+        entry_dt = datetime.fromisoformat(result["opened_at"])
+        hold_min = int((datetime.now(timezone.utc) - entry_dt).total_seconds() / 60)
+    except Exception:
+        hold_min = 0
 
-    for coin, pos in positions.items():
-        cfg = SYMBOLS[coin]
-        symbol = cfg["symbol"]
-
-        try:
-            current_price = get_current_price(symbol)
-            direction = pos["direction"]
-            sl_price = pos["sl_price"]
-            tp_price = pos["tp_price"]
-            entry_time = pos["opened_at"]
-
-            # 보유 시간 계산
-            try:
-                entry_dt = datetime.fromisoformat(entry_time)
-                hold_minutes = int(
-                    (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
-                )
-            except Exception:
-                hold_minutes = 0
-
-            # SOL 트레일링 스탑 업데이트 (단계별)
-            if cfg["trailing_stop"]:
-                candles_1h = fetch_candles(symbol, "1h", limit=20)
-                atr = sol_strategy.get_current_atr(candles_1h)
-                new_sl = position_manager.update_trailing_stop(
-                    coin, current_price, atr
-                )
-                if new_sl:
-                    sl_price = new_sl
-
-            # 손절 체크
-            sl_hit = (
-                (direction == "LONG"  and current_price <= sl_price) or
-                (direction == "SHORT" and current_price >= sl_price)
-            )
-
-            # 익절 체크
-            tp_hit = False
-            if tp_price:
-                tp_hit = (
-                    (direction == "LONG"  and current_price >= tp_price) or
-                    (direction == "SHORT" and current_price <= tp_price)
-                )
-
-            # 거래소 포지션 실제 확인 (SL/TP 거래소에서 자동 청산됐을 경우)
-            try:
-                exchange_positions = exchange.fetch_positions([symbol])
-                exchange_has_position = any(
-                    float(p["contracts"]) != 0 for p in exchange_positions
-                )
-                if not exchange_has_position and position_manager.has_position(coin):
-                    # 거래소에서 자동 청산됨 — 수익 여부로 TP/SL 구분
-                    close_price = get_current_price(symbol)
-                    if direction == "LONG":
-                        is_profit = close_price > pos["entry_price"]
-                    else:
-                        is_profit = close_price < pos["entry_price"]
-                    close_type = "TP" if is_profit else "SL"
-                    result = position_manager.close_position(coin, close_type, close_price)
-                    if result:
-                        _handle_close(coin, result, hold_minutes, close_type)
-                    continue
-            except Exception:
-                pass
-
-            if sl_hit:
-                close_price = close_order(symbol, direction)
-                # 트레일링 스탑/손절 구분: 수익이면 TP, 손실이면 SL
-                if direction == "LONG":
-                    is_profit = close_price > pos["entry_price"]
-                else:
-                    is_profit = close_price < pos["entry_price"]
-                close_type = "TP" if is_profit else "SL"
-                result = position_manager.close_position(coin, close_type, close_price)
-                if result:
-                    _handle_close(coin, result, hold_minutes, close_type)
-
-            elif tp_hit:
-                close_price = close_order(symbol, direction)
-                result = position_manager.close_position(coin, "TP", close_price)
-                if result:
-                    _handle_close(coin, result, hold_minutes, "TP")
-
-        except Exception as e:
-            logger.error(f"[{coin}] 포지션 모니터링 오류: {e}")
-
-
-def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -> None:
-    """청산 후 처리 — 텔레그램 + 매매일지 + 리스크 체크"""
-    # 텔레그램 알림
-    if close_type == "TP":
-        notifier.notify_close_tp(
-            coin, result["direction"],
-            result["entry_price"], result["close_price"],
-            result["pnl_usdt"], result["pnl_pct"],
-            hold_minutes,
-        )
+    if result["is_profit"]:
+        notifier.notify_close_tp(coin, result["direction"], result["entry_price"],
+                                 result["close_price"], result["pnl_usdt"],
+                                 result["pnl_pct"], hold_min)
     else:
-        state = risk_manager.get_state()
-        notifier.notify_close_sl(
-            coin, result["direction"],
-            result["entry_price"], result["close_price"],
-            result["pnl_usdt"], result["pnl_pct"],
-            hold_minutes,
-            state["daily_stop_count"],
-            2,
-        )
+        notifier.notify_close_sl(coin, result["direction"], result["entry_price"],
+                                 result["close_price"], result["pnl_usdt"],
+                                 result["pnl_pct"], hold_min, 0, 0)
 
     # 매매일지 기록
     try:
-        candles_1h = fetch_candles(SYMBOLS[coin]["symbol"], "1h", limit=250)
-        from main import record_trade_journal
-        record_trade_journal(
-            coin, result, candles_1h,
-            candle_filter.get_bias(coin),
-            get_funding_rate(SYMBOLS[coin]["symbol"]),
-        )
-        # 매매일지 기록 완료 알림 + 학습까지 남은 건수
-        total_count = len(load_all_trades())
-        notifier.notify_journal_recorded(
-            coin, result["direction"], close_type,
-            result["pnl_usdt"], total_count, min_required=30
-        )
+        candles = fetch_candles(SYMBOLS[coin]["symbol"], "1h", limit=100)
+        _record_journal(coin, result, candles)
     except Exception as e:
         logger.error(f"[{coin}] 매매일지 기록 오류: {e}")
 
-    # 손절 시 전면 중단 체크
-    if close_type in ("SL", "TRAILING"):
-        if not risk_manager.is_trading_allowed():
-            notifier.notify_daily_halt(
-                risk_manager.get_state()["daily_stop_count"],
-                get_balance(),
-            )
+
+def _record_journal(coin: str, result: dict, candles: list) -> None:
+    """매매일지 기록 (신호기반 전략용 간소화)"""
+    from utils.indicators import candles_to_dataframe, calculate_atr, calculate_supertrend
+    df = candles_to_dataframe(candles)
+    atr = calculate_atr(df)
+    cfg = SYMBOLS[coin]
+    st_df = calculate_supertrend(df, atr_period=cfg["st_atr_period"], multiplier=cfg["st_multiplier"])
+    st_dir = int(st_df["supertrend_dir"].iloc[-1])
+    close_type = "TP" if result["is_profit"] else "SL"
+    try:
+        record_trade(
+            symbol=coin, direction=result["direction"],
+            entry_time=result["opened_at"], entry_price=result["entry_price"],
+            exit_price=result["close_price"], sl_price=0, tp_price=None,
+            exit_type=close_type, pnl_usdt=result["pnl_usdt"], pnl_pct=result["pnl_pct"],
+            leverage=result["leverage"], position_usdt=result["position_usdt"],
+            supertrend_dir=st_dir, atr=atr, ema200=None, rsi=None, macd=None,
+            bb_position=None, volume_ratio=None, daily_bias=result["direction"],
+            funding_rate=0.0,
+        )
+        total = len(load_all_trades())
+        notifier.notify_journal_recorded(coin, result["direction"], close_type,
+                                         result["pnl_usdt"], total, min_required=0)
+    except Exception as e:
+        logger.error(f"[{coin}] 매매일지 record_trade 오류: {e}")
 
 
 # ============================================================
@@ -658,107 +382,66 @@ def _handle_close(coin: str, result: dict, hold_minutes: int, close_type: str) -
 # ============================================================
 
 def run() -> None:
-    """봇 메인 실행 루프"""
     global exchange
-
     shutdown = GracefulShutdown()
 
     logger.info("=" * 70)
-    logger.info("자동매매 봇 시작")
-    logger.info("BTC / ETH / XRP / SOL 선물 | 슈퍼트렌드 전략")
+    logger.info("자동매매 봇 시작 — 리플·이더 슈퍼트렌드 신호기반")
     logger.info("=" * 70)
 
     try:
-        # 디스크 체크
         if not check_disk_space():
             return
-
-        # 거래소 연결
         exchange = connect_binance()
 
-        # 전략 함수 바인딩
-        _bind_strategy_functions()
-
-        # 초기 일봉 바이어스 설정
-        def fetch_daily(symbol):
-            return fetch_candles(symbol, "1d", limit=3)
-        bias_dict = candle_filter.update_all_bias(fetch_daily)
-
-        # 봇 시작 시 거래소 실제 포지션 동기화 (중복 진입 방지)
+        # 거래소 실제 포지션 동기화 (중복진입 방지)
         sync_positions_from_exchange()
+
+        # 다음전환대기(이더) 초기상태: armed=True (시작 후 첫 전환부터 진입)
+        # 1캔들지연(리플) 초기상태: pending=None (전환 감지부터 시작)
+        for coin, cfg in SYMBOLS.items():
+            if cfg["exit_mode"] == "wait_next" and not position_manager.has_position(coin):
+                position_manager.set_armed(coin, True)
 
         total_balance = get_balance()
         notifier.send_message(
-            f"🚀 *자동매매 봇 시작*\n"
+            f"🚀 *자동매매 봇 시작 (신규 전략)*\n"
             f"─────────────────\n"
-            f"종목: BTC / ETH / XRP / SOL\n"
-            f"전략: 슈퍼트렌드 + 보조지표\n"
-            f"잔고: `{total_balance:,.0f} USDT`\n"
-            f"BTC: {bias_dict.get('BTC')} | ETH: {bias_dict.get('ETH')}\n"
-            f"XRP: {bias_dict.get('XRP')} | SOL: {bias_dict.get('SOL')}"
+            f"종목: 리플 / 이더\n"
+            f"전략: 슈퍼트렌드 단독 + 신호기반 청산\n"
+            f"리플 4배 25% / 이더 2배 40%\n"
+            f"잔고: `{total_balance:,.2f} USDT`"
         )
 
-        last_reset_date = None
-        last_signal_hour = -1  # 봇 시작 시 즉시 시그널 체크
+        last_signal_hour = -1
         last_disk_check = datetime.now()
 
         while not shutdown.is_shutting_down():
-
             now_utc = datetime.now(timezone.utc)
-            now_kst = datetime.now(KST)
 
-            # ── 디스크 체크 (10분마다) ───────────────────────
             if datetime.now() - last_disk_check > timedelta(minutes=10):
                 check_disk_space()
                 last_disk_check = datetime.now()
 
-            # ── 자정 초기화 UTC 기준 (일봉 완전 확정 후: 00:05 이후) ──
-            # UTC 00:00 정각엔 직전 일봉이 미완성일 수 있어 5분 대기
-            if last_reset_date != now_utc.date() and (now_utc.hour > 0 or now_utc.minute >= 5):
-                daily_reset()
-                last_reset_date = now_utc.date()
-
-            # ── 주간 XGBoost 최적화 (일요일 새벽 3시 KST) ────
-            if now_kst.weekday() == 6 and now_kst.hour == 3 and now_kst.minute < 1:
-                trades = load_all_trades()
-                result = run_optimization(trades, notifier)
-                if result.get("full_reset_required"):
-                    notifier.notify_bot_shutdown("전략 전면 수정 필요 — 손절 비율 80% 초과")
-                    raise SystemExit("전략 전면 수정 필요")
-                gc.collect()
-
-            # ── 1시간봉 시그널 체크 ───────────────────────────
-            if last_signal_hour != now_utc.hour:
+            # 1시간봉 마감 처리: 매시간 정각 직후(분이 1 이상) 한 번
+            if last_signal_hour != now_utc.hour and now_utc.minute >= 1:
                 last_signal_hour = now_utc.hour
-
                 for coin in SYMBOLS.keys():
                     try:
-                        signal = process_signal(coin)
-                        if signal:
-                            execute_entry(coin, signal)
+                        process_coin(coin)
                     except Exception as e:
-                        logger.error(f"[{coin}] 시그널 처리 오류: {e}")
-                        notifier.notify_bot_error(f"[{coin}] 시그널 처리 오류", str(e)[:150])
-
-            # ── 포지션 실시간 모니터링 ────────────────────────
-            try:
-                monitor_positions()
-            except Exception as e:
-                logger.error(f"포지션 모니터링 오류: {e}")
+                        logger.error(f"[{coin}] 신호 처리 오류: {e}\n{traceback.format_exc()}")
+                        notifier.notify_bot_error(f"[{coin}] 신호 처리 오류", str(e)[:150])
 
             time.sleep(5)
 
     except SystemExit as e:
         logger.critical(f"봇 종료: {e}")
-
     except Exception as e:
         logger.error(f"치명적 오류: {e}\n{traceback.format_exc()}")
         notifier.notify_bot_error("치명적 오류", f"{type(e).__name__}: {str(e)[:150]}")
-
     finally:
-        logger.info("=" * 70)
         logger.info("자동매매 봇 종료")
-        logger.info("=" * 70)
         notifier.notify_bot_shutdown("봇이 종료되었습니다.")
 
 
