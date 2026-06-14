@@ -115,19 +115,12 @@ def notify_entry(
     signal_info: dict = None,
     daily_bias: str = None,
 ) -> None:
-    """포지션 진입 알림"""
+    """포지션 진입 알림 (신호기반 전략: 손절/목표가 없음)"""
     direction_emoji = "🟢" if direction == "LONG" else "🔴"
     direction_kr = "롱" if direction == "LONG" else "숏"
 
-    sl_pct = abs(sl_price - entry_price) / entry_price * 100
-    sl_sign = "-" if direction == "LONG" else "+"
-
-    if tp_price:
-        tp_pct = abs(tp_price - entry_price) / entry_price * 100
-        tp_sign = "+" if direction == "LONG" else "-"
-        tp_str = f"${tp_price:,.4f} ({tp_sign}{tp_pct:.2f}%)"
-    else:
-        tp_str = "트레일링 스탑"
+    # 신호기반 청산: 손절가/목표가가 없으므로(0 또는 None) 청산 방식만 표시
+    exit_str = "슈퍼트렌드 반대 전환 시"
 
     # 시그널 근거
     signal_text = ""
@@ -136,20 +129,14 @@ def notify_entry(
         for key, value in signal_info.items():
             signal_text += f"{key}: {value}\n"
 
-    # 전일 바이어스
-    bias_emoji = {"LONG": "🟢 양봉", "SHORT": "🔴 음봉", "NONE": "⚪ 도지"}.get(daily_bias, "")
-    bias_text = f"\n전일 일봉: {bias_emoji}" if bias_emoji else ""
-
     text = (
         f"{direction_emoji} *[{symbol}] {direction_kr} 진입*\n"
         f"─────────────────\n"
         f"진입가:   `${entry_price:,.4f}`\n"
-        f"손절가:   `${sl_price:,.4f} ({sl_sign}{sl_pct:.2f}%)`\n"
-        f"목표가:   `{tp_str}`\n"
+        f"청산조건: `{exit_str}`\n"
         f"레버리지: `{leverage}x`\n"
-        f"증거금:   `{position_usdt:,.0f} USDT`"
-        f"{signal_text}"
-        f"{bias_text}\n"
+        f"증거금:   `{position_usdt:,.2f} USDT`"
+        f"{signal_text}\n"
         f"🕐 {_now_kst()}"
     )
     send_message(text)
