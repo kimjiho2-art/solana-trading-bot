@@ -284,10 +284,7 @@ def process_coin(coin: str) -> None:
     if not has_pos:
         if mode == "delay1":
             position_manager.set_pending(coin, sig["direction"])
-            logger.info(f"[{coin}] 현재 추세 진입 예약")
-        elif mode == "wait_next":
-        
-            
+            logger.info(f"[{coin}] 현재 추세 진입 예약")  
         elif mode == "wait_next":
             # 다음전환대기: armed 상태에서 전환 오면 진입
             if sig["flipped"] and position_manager.is_armed(coin):
