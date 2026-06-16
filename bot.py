@@ -2,9 +2,11 @@
 # bot.py — 메인 실행 파일 (리플·이더 신호기반 전략)
 # ============================================================
 # 실행: python bot.py  (저장소 루트)
-# 전략: 슈퍼트렌드 단독 + 신호기반 청산
-#   XRP: ATR10/3.0 + 1캔들지연 + 4배 + 25%
-#   ETH: ATR14/3.5 + 다음전환대기 + 2배 + 40%
+# 전략: 슈퍼트렌드 단독 + 신호기반 청산 (백테스트 일치)
+#   XRP: ATR10/3.0 + 1캔들지연 진입 + 4배 + 25%
+#   ETH: ATR14/3.5 + 다음전환대기 진입 + 2배 + 40%
+#   청산: 현재 슈퍼트렌드 방향이 포지션과 반대면 즉시 (백테스트와 동일)
+#   진입: 전환(flip) 시점에 (delay1=다음봉, wait_next=전환봉)
 # ============================================================
 
 import logging
@@ -53,13 +55,8 @@ logger.addHandler(logging.StreamHandler())
 exchange = None
 KST = timezone(timedelta(hours=9))
 
-# 전략 매핑
 STRATEGY = {"XRP": xrp_strategy, "ETH": eth_strategy}
 
-
-# ============================================================
-# 유틸리티 / 인프라 (기존 봇에서 재사용)
-# ============================================================
 
 def retry(max_retries=3, delay=5):
     def decorator(func):
@@ -126,10 +123,6 @@ def connect_binance():
     return exch
 
 
-# ============================================================
-# 거래소 API 함수
-# ============================================================
-
 @retry(max_retries=2, delay=3)
 def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list:
     return exchange.fetch_ohlcv(symbol, interval, limit=limit)
@@ -153,7 +146,6 @@ def get_current_price(symbol: str) -> float:
 
 
 def place_order(symbol: str, direction: str, usdt_amount: float, leverage: int) -> bool:
-    """시장가 진입. 신호기반 청산이므로 손절/익절 주문 안 검."""
     try:
         current_price = get_current_price(symbol)
         notional = usdt_amount * leverage
@@ -176,7 +168,6 @@ def place_order(symbol: str, direction: str, usdt_amount: float, leverage: int) 
 
 
 def close_order(symbol: str, direction: str) -> float:
-    """시장가 청산."""
     try:
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
@@ -197,19 +188,17 @@ def close_order(symbol: str, direction: str) -> float:
         return get_current_price(symbol)
 
 
-# ============================================================
-# 봇 시작 시 거래소 포지션 동기화 (중복진입 방지)
-# ============================================================
-
 def sync_positions_from_exchange() -> None:
     logger.info("거래소 포지션 동기화 시작")
     for coin, cfg in SYMBOLS.items():
         symbol = cfg["symbol"]
         try:
             positions = exchange.fetch_positions([symbol])
+            found = False
             for pos in positions:
                 contracts = float(pos.get("contracts") or 0)
                 if contracts != 0:
+                    found = True
                     direction = "LONG" if pos["side"] == "long" else "SHORT"
                     entry_price = float(pos.get("entryPrice") or 0)
                     if not position_manager.has_position(coin):
@@ -219,26 +208,25 @@ def sync_positions_from_exchange() -> None:
                             leverage=cfg["max_leverage"],
                         )
                         logger.info(f"[{coin}] 기존 포지션 동기화: {direction} @ {entry_price}")
+            # 거래소에 포지션 없는데 봇은 있다고 알면 정리
+            if not found and position_manager.has_position(coin):
+                position_manager.close_position(coin, get_current_price(symbol))
+                logger.info(f"[{coin}] 거래소에 포지션 없음 — 봇 기록 정리")
         except Exception as e:
             logger.warning(f"[{coin}] 포지션 동기화 실패: {e}")
     logger.info("거래소 포지션 동기화 완료")
 
 
-# ============================================================
-# 신호 처리 (매시간 봉 마감마다)
-# ============================================================
-
 def process_coin(coin: str) -> None:
     """
-    단일 코인 신호 처리.
-    슈퍼트렌드 방향/전환을 보고 진입·청산 판단.
-    리플=1캔들지연, 이더=다음전환대기.
+    단일 코인 신호 처리 (백테스트 로직과 동일).
+    - 청산: 포지션 보유 중 현재 슈퍼트렌드 방향이 반대면 즉시 청산
+    - 진입: delay1=전환 다음봉, wait_next=전환봉(armed 상태)
     """
     cfg = SYMBOLS[coin]
     symbol = cfg["symbol"]
     mode = cfg["exit_mode"]
 
-    # 완성된 1시간봉 기준 신호 (마지막 진행중 봉 제외 위해 limit 넉넉히)
     candles = fetch_candles(symbol, "1h", limit=100)
     if not candles or len(candles) < 30:
         logger.warning(f"[{coin}] 캔들 부족")
@@ -251,51 +239,50 @@ def process_coin(coin: str) -> None:
     has_pos = position_manager.has_position(coin)
     pos_dir = position_manager.get_position_direction(coin)
 
-    # ───────────────────────────────────────────────
-    # 1) 청산 판단: 포지션 보유 중 + 슈퍼트렌드가 반대로 전환
-    # ───────────────────────────────────────────────
-    if has_pos and sig["flipped"] and sig["flip_to"] != pos_dir:
-        close_price = close_order(symbol, pos_dir)
-        result = position_manager.close_position(coin, close_price)
-        if result:
-            _handle_close(coin, result)
+    # 매시간 상태 로그 (투명성 — 무슨 일이 있어도 흔적이 남도록)
+    logger.info(
+        f"[{coin}] ST방향={sig['direction']} 전환={sig['flipped']} "
+        f"보유={'있음('+str(pos_dir)+')' if has_pos else '없음'} "
+        f"pending={position_manager.get_pending(coin)} armed={position_manager.is_armed(coin)}"
+    )
 
-        if mode == "delay1":
-            # 리플: 반대방향 다음봉 진입 예약
-            position_manager.set_pending(coin, sig["flip_to"])
-        elif mode == "wait_next":
-            # 이더: 청산 후 대기. 다음 전환에 진입
-            position_manager.set_armed(coin, True)
-        return
-
-    # ───────────────────────────────────────────────
-    # 2) delay1 예약 진입 (리플): 지난 봉에 예약된 방향으로 진입
-    # ───────────────────────────────────────────────
-    if mode == "delay1":
+    # ── delay1 예약 진입 (리플): 지난 봉 예약분 먼저 실행 ──
+    if mode == "delay1" and not has_pos:
         pending = position_manager.get_pending(coin)
-        if pending and not has_pos:
+        if pending:
             _enter(coin, pending)
             position_manager.set_pending(coin, None)
             return
 
-    # ───────────────────────────────────────────────
-    # 3) 신규 진입 판단
-    # ───────────────────────────────────────────────
+    # ── 1) 청산: 현재 방향이 포지션과 반대 (백테스트와 동일) ──
+    if has_pos and sig["direction"] != pos_dir:
+        close_price = close_order(symbol, pos_dir)
+        result = position_manager.close_position(coin, close_price)
+        if result:
+            _handle_close(coin, result)
+        if mode == "delay1":
+            # 리플: 반대방향 다음봉 진입 예약
+            position_manager.set_pending(coin, sig["direction"])
+        elif mode == "wait_next":
+            # 이더: 청산 후 다음 전환까지 대기
+            position_manager.set_armed(coin, True)
+        return
+
+    # ── 2) 신규 진입 (전환 시점) ──
     if not has_pos:
         if mode == "delay1":
-            position_manager.set_pending(coin, sig["direction"])
-            logger.info(f"[{coin}] 현재 추세 진입 예약")  
+            # 전환 시 다음봉 진입 예약
+            if sig["flipped"]:
+                position_manager.set_pending(coin, sig["flip_to"])
+                logger.info(f"[{coin}] 전환 감지 → 다음봉 {sig['flip_to']} 진입 예약")
         elif mode == "wait_next":
-            # 다음전환대기: armed 상태에서 전환 오면 진입
+            # armed 상태에서 전환 시 진입 (최초 진입 포함)
             if sig["flipped"] and position_manager.is_armed(coin):
                 _enter(coin, sig["flip_to"])
                 position_manager.set_armed(coin, False)
-            # 최초 진입(armed도 아니고 pending도 없는 초기상태)은
-            # 봇 시작 후 첫 전환부터 (set_armed True가 초기설정)
 
 
 def _enter(coin: str, direction: str) -> None:
-    """진입 실행 (중복진입 방지: 보유중이면 차단)"""
     if position_manager.has_position(coin):
         logger.info(f"[{coin}] 이미 포지션 보유 — 진입 차단")
         return
@@ -314,7 +301,7 @@ def _enter(coin: str, direction: str) -> None:
             notifier.notify_entry(
                 coin, direction, entry_price, 0, None,
                 size["leverage"], size["position_usdt"],
-                signal_info={"슈퍼트렌드": f"{direction} 전환"},
+                signal_info={"슈퍼트렌드": f"{direction} 방향"},
                 daily_bias=direction,
             )
     except Exception as e:
@@ -323,7 +310,6 @@ def _enter(coin: str, direction: str) -> None:
 
 
 def _handle_close(coin: str, result: dict) -> None:
-    """청산 후 처리: 텔레그램 + 매매일지"""
     close_type = "TP" if result["is_profit"] else "SL"
     try:
         entry_dt = datetime.fromisoformat(result["opened_at"])
@@ -340,7 +326,6 @@ def _handle_close(coin: str, result: dict) -> None:
                                  result["close_price"], result["pnl_usdt"],
                                  result["pnl_pct"], hold_min, 0, 0)
 
-    # 매매일지 기록
     try:
         candles = fetch_candles(SYMBOLS[coin]["symbol"], "1h", limit=100)
         _record_journal(coin, result, candles)
@@ -349,7 +334,6 @@ def _handle_close(coin: str, result: dict) -> None:
 
 
 def _record_journal(coin: str, result: dict, candles: list) -> None:
-    """매매일지 기록 (신호기반 전략용 간소화)"""
     from utils.indicators import candles_to_dataframe, calculate_atr, calculate_supertrend
     df = candles_to_dataframe(candles)
     atr = calculate_atr(df)
@@ -375,10 +359,6 @@ def _record_journal(coin: str, result: dict, candles: list) -> None:
         logger.error(f"[{coin}] 매매일지 record_trade 오류: {e}")
 
 
-# ============================================================
-# 메인 루프
-# ============================================================
-
 def run() -> None:
     global exchange
     shutdown = GracefulShutdown()
@@ -391,12 +371,9 @@ def run() -> None:
         if not check_disk_space():
             return
         exchange = connect_binance()
-
-        # 거래소 실제 포지션 동기화 (중복진입 방지)
         sync_positions_from_exchange()
 
-        # 다음전환대기(이더) 초기상태: armed=True (시작 후 첫 전환부터 진입)
-        # 1캔들지연(리플) 초기상태: pending=None (전환 감지부터 시작)
+        # wait_next(이더) 초기 armed (시작 후 첫 전환부터 진입)
         for coin, cfg in SYMBOLS.items():
             if cfg["exit_mode"] == "wait_next" and not position_manager.has_position(coin):
                 position_manager.set_armed(coin, True)
@@ -421,9 +398,13 @@ def run() -> None:
                 check_disk_space()
                 last_disk_check = datetime.now()
 
-            # 1시간봉 마감 처리: 매시간 정각 직후(분이 1 이상) 한 번
             if last_signal_hour != now_utc.hour and now_utc.minute >= 1:
                 last_signal_hour = now_utc.hour
+                # 매시간 거래소 포지션 재동기화 (인식 누락 방지)
+                try:
+                    sync_positions_from_exchange()
+                except Exception as e:
+                    logger.warning(f"재동기화 실패: {e}")
                 for coin in SYMBOLS.keys():
                     try:
                         process_coin(coin)
