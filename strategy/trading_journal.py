@@ -30,7 +30,7 @@ COLUMNS = [
     "pnl_pct",            # 손익률 %
     "leverage",           # 레버리지
     "position_usdt",      # 증거금
-    "supertrend_dir",     # 슈퍼트렌드 방향 (1=상승/-1=하락)
+    "supertrend_dir",     # 슈퍼트렌드 방향 (-1=상승/1=하락)
     "atr",                # ATR 값
     "ema200",             # EMA 200 (BTC용)
     "rsi",                # RSI 값
@@ -47,6 +47,29 @@ def _now_kst() -> str:
     """현재 시각 KST 반환"""
     kst = timezone(timedelta(hours=9))
     return datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_to_kst_str(time_str: str) -> str:
+    """
+    다양한 형식의 시각 문자열을 KST '%Y-%m-%d %H:%M:%S' 로 통일한다.
+    - 타임존이 포함된 ISO 형식(예: 2026-06-17T10:00:00+00:00) → KST로 변환
+      (position_manager.open_position 이 UTC ISO 로 저장하므로 이 경로를 탄다)
+    - 타임존이 없는 시각(이미 KST 벽시계 시각으로 간주) → 그대로
+    - 알 수 없는 형식 → 원본 유지
+    """
+    kst = timezone(timedelta(hours=9))
+    fmt = "%Y-%m-%d %H:%M:%S"
+    if not time_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(time_str)
+        if dt.tzinfo is not None:
+            # 타임존 정보가 있으면 KST 로 변환
+            return dt.astimezone(kst).strftime(fmt)
+        # 타임존 정보가 없으면 이미 KST 시각으로 간주 → 시간 이동 없이 그대로
+        return dt.strftime(fmt)
+    except (ValueError, TypeError):
+        return time_str
 
 
 def _get_journal_path() -> str:
@@ -113,12 +136,14 @@ def record_trade(
     _ensure_header(path)
 
     exit_time = _now_kst()
+    # 진입 시각을 KST 표준 형식으로 정규화 (UTC ISO 등 어떤 형식이 들어와도 통일)
+    entry_time_kst = _normalize_to_kst_str(entry_time)
     trade_id = _get_next_trade_id()
 
-    # 보유 시간 계산 (분)
+    # 보유 시간 계산 (분) — entry/exit 모두 동일한 KST 기준이라 정확히 계산됨
     try:
         fmt = "%Y-%m-%d %H:%M:%S"
-        entry_dt = datetime.strptime(entry_time, fmt)
+        entry_dt = datetime.strptime(entry_time_kst, fmt)
         exit_dt = datetime.strptime(exit_time, fmt)
         hold_minutes = int((exit_dt - entry_dt).total_seconds() / 60)
     except Exception:
@@ -128,7 +153,7 @@ def record_trade(
         "trade_id": trade_id,
         "symbol": symbol,
         "direction": direction,
-        "entry_time": entry_time,
+        "entry_time": entry_time_kst,
         "exit_time": exit_time,
         "hold_minutes": hold_minutes,
         "entry_price": round(entry_price, 6),
