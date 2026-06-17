@@ -119,7 +119,9 @@ def calculate_supertrend(
     슈퍼트렌드 계산
     Returns: DataFrame with columns:
         supertrend       : 슈퍼트렌드 값
-        supertrend_dir   : 1 = 상승(롱), -1 = 하락(숏)
+        supertrend_dir   : -1 = 상승(롱), 1 = 하락(숏)
+                           ⚠️ config.py 의 SUPERTREND_DIR(LONG=-1, SHORT=1)과 동일.
+                           (이 방향 정의를 절대 반대로 적지 말 것 — 과거 전부 SHORT 쏠림 원인)
         supertrend_cross : 'BUY' / 'SELL' / None (전환 시점)
     """
     high = df["high"]
