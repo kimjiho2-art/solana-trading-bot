@@ -7,6 +7,7 @@
 #   ETH: ATR14/3.5 + 다음전환대기 진입 + 2배 + 40%
 #   청산: 현재 슈퍼트렌드 방향이 포지션과 반대면 즉시 (백테스트와 동일)
 #   진입: 전환(flip) 시점에 (delay1=다음봉, wait_next=전환봉)
+#   ⚠️ 신호는 '마감된 봉'으로만 계산한다 (백테스트가 종가 기준이므로).
 # ============================================================
 
 import logging
@@ -125,7 +126,23 @@ def connect_binance():
 
 @retry(max_retries=2, delay=3)
 def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list:
+    """원시 캔들 조회 (진행 중인 마지막 봉 포함)."""
     return exchange.fetch_ohlcv(symbol, interval, limit=limit)
+
+
+def fetch_closed_candles(symbol: str, interval: str, limit: int = 100) -> list:
+    """
+    '마감된 봉'만 반환한다 (진행 중인 마지막 봉을 잘라냄).  ← B1
+
+    거래소 OHLCV의 마지막 항목은 아직 형성 중인(미완성) 봉이다.
+    백테스트가 종가(마감봉) 기준으로 신호를 냈으므로, 라이브도 마감봉으로
+    신호/지표를 계산해야 백테스트와 일치한다.
+    limit+1 개를 받아 마지막(진행 중) 1개를 버려 정확히 limit 개의 마감봉을 돌려준다.
+    """
+    raw = fetch_candles(symbol, interval, limit=limit + 1)
+    if not raw:
+        return []
+    return raw[:-1]
 
 
 def get_balance() -> float:
@@ -229,7 +246,7 @@ def sync_positions_from_exchange() -> None:
                     except Exception as e:
                         logger.warning(f"[{coin}] 외부 청산 알림 실패: {e}")
                     try:
-                        candles = fetch_candles(symbol, "1h", limit=100)
+                        candles = fetch_closed_candles(symbol, "1h", limit=100)
                         _record_journal(coin, result, candles)
                     except Exception as e:
                         logger.error(f"[{coin}] 외부 청산 일지 기록 오류: {e}")
@@ -247,12 +264,14 @@ def process_coin(coin: str) -> None:
     단일 코인 신호 처리 (백테스트 로직과 동일).
     - 청산: 포지션 보유 중 현재 슈퍼트렌드 방향이 반대면 즉시 청산
     - 진입: delay1=전환 다음봉, wait_next=전환봉(armed 상태)
+    - 신호는 '마감된 봉'으로만 계산 (B1, 백테스트 종가 기준과 일치)
     """
     cfg = SYMBOLS[coin]
     symbol = cfg["symbol"]
     mode = cfg["exit_mode"]
 
-    candles = fetch_candles(symbol, "1h", limit=100)
+    # B1: 진행 중인 봉을 제외하고 마감된 봉만 사용
+    candles = fetch_closed_candles(symbol, "1h", limit=100)
     if not candles or len(candles) < 30:
         logger.warning(f"[{coin}] 캔들 부족")
         return
@@ -352,7 +371,8 @@ def _handle_close(coin: str, result: dict) -> None:
                                  result["pnl_pct"], hold_min, 0, 0)
 
     try:
-        candles = fetch_candles(SYMBOLS[coin]["symbol"], "1h", limit=100)
+        # 일지 기록도 마감봉 기준으로 (B1)
+        candles = fetch_closed_candles(SYMBOLS[coin]["symbol"], "1h", limit=100)
         _record_journal(coin, result, candles)
     except Exception as e:
         logger.error(f"[{coin}] 매매일지 기록 오류: {e}")
