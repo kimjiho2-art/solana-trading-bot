@@ -208,10 +208,35 @@ def sync_positions_from_exchange() -> None:
                             leverage=cfg["max_leverage"],
                         )
                         logger.info(f"[{coin}] 기존 포지션 동기화: {direction} @ {entry_price}")
-            # 거래소에 포지션 없는데 봇은 있다고 알면 정리
+            # ── 거래소엔 포지션 없는데 봇은 있다고 알면 정리 (외부 청산 감지) ──
+            #    수동 청산·강제청산(liquidation) 등으로 process_coin 청산 분기를
+            #    거치지 않고 사라진 경우. 일지/알림을 남기고, wait_next(이더)는
+            #    armed를 복구해야 다시 진입할 수 있다. (A1 + Fix7)
             if not found and position_manager.has_position(coin):
-                position_manager.close_position(coin, get_current_price(symbol))
-                logger.info(f"[{coin}] 거래소에 포지션 없음 — 봇 기록 정리")
+                close_price = get_current_price(symbol)
+                result = position_manager.close_position(coin, close_price)
+                logger.info(f"[{coin}] 거래소에 포지션 없음 — 외부 청산 감지, 봇 기록 정리")
+                if result:
+                    try:
+                        notifier.send_message(
+                            f"⚠️ *[{coin}] 외부 청산 감지*\n"
+                            f"─────────────────\n"
+                            f"거래소에 포지션이 없어 봇 기록을 정리했습니다.\n"
+                            f"(수동 청산 또는 강제청산 가능성)\n"
+                            f"추정 손익: `{result['pnl_usdt']:+,.2f} USDT`\n"
+                            f"추정 청산가: `${close_price:,.4f}`"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[{coin}] 외부 청산 알림 실패: {e}")
+                    try:
+                        candles = fetch_candles(symbol, "1h", limit=100)
+                        _record_journal(coin, result, candles)
+                    except Exception as e:
+                        logger.error(f"[{coin}] 외부 청산 일지 기록 오류: {e}")
+                # wait_next(이더): 다음 전환부터 재진입 가능하도록 armed 복구
+                if cfg["exit_mode"] == "wait_next":
+                    position_manager.set_armed(coin, True)
+                    logger.info(f"[{coin}] 외부 청산 후 armed 복구 — 다음 전환부터 재진입 가능")
         except Exception as e:
             logger.warning(f"[{coin}] 포지션 동기화 실패: {e}")
     logger.info("거래소 포지션 동기화 완료")
@@ -390,9 +415,24 @@ def run() -> None:
 
         last_signal_hour = -1
         last_disk_check = datetime.now()
+        # A2: 일일 통계 초기화 기준일 (KST). 시작 시점 날짜로 초기화 → 시작 직후 결산 안 보냄
+        last_reset_date = datetime.now(KST).date()
 
         while not shutdown.is_shutting_down():
             now_utc = datetime.now(timezone.utc)
+
+            # ── A2: KST 자정 일일 통계 초기화 ──────────────────
+            #    날짜(KST)가 바뀌면 전일 결산 보고 후 통계 리셋.
+            #    텔레그램 표시가 KST 기준이므로 리셋도 KST 자정에 맞춘다.
+            now_kst_date = datetime.now(KST).date()
+            if now_kst_date != last_reset_date:
+                try:
+                    notifier.notify_daily_summary(get_balance())
+                except Exception as e:
+                    logger.warning(f"일일 결산 보고 실패: {e}")
+                notifier.reset_daily_stats()
+                last_reset_date = now_kst_date
+                logger.info(f"[일일 초기화] {now_kst_date} — 일일 통계 리셋 완료")
 
             if datetime.now() - last_disk_check > timedelta(minutes=10):
                 check_disk_space()
